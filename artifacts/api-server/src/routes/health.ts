@@ -1,17 +1,14 @@
 import { Router, type IRouter } from "express";
 import { HealthCheckResponse } from "@workspace/api-zod";
-import { pool } from "@workspace/db";
 
 const router: IRouter = Router();
 
-router.get("/healthz", async (_req, res) => {
-  try {
-    await pool.query("SELECT 1");
-    const data = HealthCheckResponse.parse({ status: "ok" });
-    res.json(data);
-  } catch {
-    res.status(503).json({ status: "error", detail: "database unreachable" });
-  }
+// Lightweight health check — returns 200 as soon as the HTTP server is up.
+// Railway uses this to decide whether the deployment succeeded; we keep it
+// fast and dependency-free so it never blocks behind DB or bot startup.
+router.get("/healthz", (_req, res) => {
+  const data = HealthCheckResponse.parse({ status: "ok" });
+  res.json(data);
 });
 
 export default router;

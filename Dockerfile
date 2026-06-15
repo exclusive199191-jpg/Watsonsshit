@@ -12,28 +12,26 @@ COPY tsconfig.json tsconfig.base.json ./
 # Copy library packages
 COPY lib/ lib/
 
-# Copy only the api-server artifact (not the mockup sandbox)
+# Copy only the api-server artifact
 COPY artifacts/api-server/ artifacts/api-server/
 
-# Install all dependencies (dev deps needed for build + drizzle-kit)
+# Install all dependencies
 RUN pnpm install --frozen-lockfile
 
-# Build the api-server (compiles TypeScript via esbuild into dist/)
+# Compile TypeScript → dist/ via esbuild
 RUN pnpm --filter @workspace/api-server run build
 
 # ── Production image ──────────────────────────────────────────────────────────
 FROM node:22-alpine AS production
 
-RUN npm install -g pnpm@10
-
 WORKDIR /app
 
-# Copy the full workspace from builder (needed so drizzle-kit can read schema TS files at startup)
+# Copy the built workspace from the builder stage
 COPY --from=builder /app /app
 
 ENV NODE_ENV=production
 
 EXPOSE 8080
 
-# On startup: push DB schema then start the server
-CMD sh -c "pnpm --filter @workspace/db run push && node --enable-source-maps /app/artifacts/api-server/dist/index.mjs"
+# Start the server directly — migrations run inside Node.js on startup
+CMD ["node", "--enable-source-maps", "/app/artifacts/api-server/dist/index.mjs"]
