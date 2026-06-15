@@ -1,0 +1,33 @@
+# Dependencies (reinstalled in Docker)
+node_modules
+**/node_modules
+
+# Build outputs (rebuilt in Docker)
+**/dist
+**/.tsbuildinfo
+
+# Replit-specific files
+.replit
+replit.nix
+.upm
+.cache
+.local
+
+# Mockup sandbox (not needed for production)
+artifacts/mockup-sandbox
+
+# Git
+.git
+.gitignore
+
+# Logs
+*.log
+npm-debug.log*
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Environment files (use Railway env vars instead)
+.env
+.env.*
