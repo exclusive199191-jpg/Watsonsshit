@@ -36,7 +36,10 @@ function formatTimestamp(date: Date): string {
 
 async function handleRolesGivenCommand(message: Message, args: string[]) {
   const guild = message.guild;
-  if (!guild) return;
+  if (!guild) {
+    await message.reply("This command must be used in a server, not a DM.");
+    return;
+  }
 
   const userArg = args.join(" ").trim();
   if (!userArg) {
@@ -123,7 +126,10 @@ async function handleRolesGivenCommand(message: Message, args: string[]) {
 
 async function handleAllRolesGivenCommand(message: Message) {
   const guild = message.guild;
-  if (!guild) return;
+  if (!guild) {
+    await message.reply("This command must be used in a server, not a DM.");
+    return;
+  }
 
   const records = await db
     .select()
@@ -269,25 +275,43 @@ export async function startBot() {
 
   client.on(Events.MessageCreate, async (message) => {
     if (message.author.bot) return;
+
+    // Warn if MessageContent intent is missing — content will be empty string
+    if (message.content === "" && !message.author.bot) {
+      logger.warn(
+        "Received a message with empty content — 'Message Content Intent' may not be enabled in the Discord Developer Portal."
+      );
+      return;
+    }
+
     if (!message.content.startsWith(",")) return;
 
     const content = message.content.slice(1).trim();
     const lower = content.toLowerCase();
 
+    logger.info({ author: message.author.tag, content: message.content }, "Command received");
+
     try {
-      if (lower.startsWith("roles given ")) {
+      if (lower === "ping") {
+        await message.reply("🏓 Pong! Bot is alive and receiving messages.");
+      } else if (lower.startsWith("roles given ")) {
         const args = content.slice("roles given ".length).trim().split(/\s+/);
         await handleRolesGivenCommand(message, args);
       } else if (lower === "all roles given") {
         await handleAllRolesGivenCommand(message);
       } else if (lower === "help") {
         await handleHelpCommand(message);
+      } else {
+        // Unknown command — silently ignore (no noise in channels)
+        logger.info({ lower }, "Unknown command — ignored");
       }
-    } catch (err) {
-      logger.error({ err }, "Error handling command");
+    } catch (err: any) {
+      logger.error({ err: err?.message ?? err }, "Error handling command");
       await message
-        .reply("An error occurred while processing that command.")
-        .catch(() => {});
+        .reply(`❌ Error: ${err?.message ?? "Something went wrong. Check bot permissions (Send Messages, Read Message History)."}`)
+        .catch((replyErr: any) => {
+          logger.error({ replyErr: replyErr?.message }, "Also failed to send error reply — bot may lack Send Messages permission in this channel");
+        });
     }
   });
 
