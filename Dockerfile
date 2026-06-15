@@ -1,37 +1,29 @@
-FROM node:22-alpine AS builder
+FROM node:22-alpine
 
 RUN apk add --no-cache python3 make g++
+
+# Install pnpm globally and make it available for the full image lifetime
 RUN npm install -g pnpm@10
 
 WORKDIR /app
 
-# Copy workspace config first (better layer caching)
+# Copy workspace config first for better layer caching
 COPY package.json pnpm-lock.yaml pnpm-workspace.yaml .npmrc ./
 COPY tsconfig.json tsconfig.base.json ./
 
-# Copy library packages
+# Copy library packages and the api-server artifact
 COPY lib/ lib/
-
-# Copy only the api-server artifact
 COPY artifacts/api-server/ artifacts/api-server/
 
-# Install all dependencies
+# Install all dependencies (dev deps included — needed to build)
 RUN pnpm install --frozen-lockfile
 
 # Compile TypeScript → dist/ via esbuild
 RUN pnpm --filter @workspace/api-server run build
 
-# ── Production image ──────────────────────────────────────────────────────────
-FROM node:22-alpine AS production
-
-WORKDIR /app
-
-# Copy the built workspace from the builder stage
-COPY --from=builder /app /app
-
 ENV NODE_ENV=production
 
 EXPOSE 8080
 
-# Start the server directly — migrations run inside Node.js on startup
+# Run node directly — migrations happen inside the process on startup
 CMD ["node", "--enable-source-maps", "/app/artifacts/api-server/dist/index.mjs"]
