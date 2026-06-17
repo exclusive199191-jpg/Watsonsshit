@@ -4,15 +4,19 @@ import {
   Events,
   AuditLogEvent,
   PermissionsBitField,
+  EmbedBuilder,
+  Colors,
   type Message,
   type GuildMember,
 } from "discord.js";
-import { db } from "@workspace/db";
+import { db, pool } from "@workspace/db";
 import { roleAssignmentsTable } from "@workspace/db";
-import { eq, and } from "drizzle-orm";
+import { eq, and, desc, sql } from "drizzle-orm";
 import { logger } from "./lib/logger";
 
-const ELEVATED_PERMISSIONS = [
+// ── Permission detection ───────────────────────────────────────────────────────
+
+const ELEVATED_PERMISSIONS: bigint[] = [
   PermissionsBitField.Flags.Administrator,
   PermissionsBitField.Flags.BanMembers,
   PermissionsBitField.Flags.KickMembers,
@@ -26,169 +30,499 @@ const ELEVATED_PERMISSIONS = [
   PermissionsBitField.Flags.ManageThreads,
 ];
 
+const ELEVATED_PERM_NAMES: Record<string, string> = {
+  [String(PermissionsBitField.Flags.Administrator)]: "Administrator",
+  [String(PermissionsBitField.Flags.BanMembers)]: "Ban Members",
+  [String(PermissionsBitField.Flags.KickMembers)]: "Kick Members",
+  [String(PermissionsBitField.Flags.ModerateMembers)]: "Timeout Members",
+  [String(PermissionsBitField.Flags.ManageRoles)]: "Manage Roles",
+  [String(PermissionsBitField.Flags.ManageGuild)]: "Manage Guild",
+  [String(PermissionsBitField.Flags.ManageChannels)]: "Manage Channels",
+  [String(PermissionsBitField.Flags.ManageMessages)]: "Manage Messages",
+  [String(PermissionsBitField.Flags.ManageNicknames)]: "Manage Nicknames",
+  [String(PermissionsBitField.Flags.ManageWebhooks)]: "Manage Webhooks",
+  [String(PermissionsBitField.Flags.ManageThreads)]: "Manage Threads",
+};
+
 function hasElevatedPermission(permissions: PermissionsBitField): boolean {
   return ELEVATED_PERMISSIONS.some((perm) => permissions.has(perm));
 }
 
-function formatTimestamp(date: Date): string {
+function getElevatedPermNames(permissions: PermissionsBitField): string[] {
+  return ELEVATED_PERMISSIONS
+    .filter((perm) => permissions.has(perm))
+    .map((perm) => ELEVATED_PERM_NAMES[String(perm)] ?? "Unknown");
+}
+
+// ── Helpers ────────────────────────────────────────────────────────────────────
+
+function ts(date: Date): string {
   return `<t:${Math.floor(date.getTime() / 1000)}:f>`;
 }
 
-async function handleRolesGivenCommand(message: Message, args: string[]) {
-  const guild = message.guild;
-  if (!guild) {
-    await message.reply("This command must be used in a server, not a DM.");
+function resolveUserArg(arg: string): { id: string | null; raw: string } {
+  const mentionMatch = arg.match(/^<@!?(\d+)>$/);
+  if (mentionMatch) return { id: mentionMatch[1], raw: arg };
+  if (/^\d+$/.test(arg)) return { id: arg, raw: arg };
+  return { id: null, raw: arg };
+}
+
+function errorEmbed(msg: string): EmbedBuilder {
+  return new EmbedBuilder()
+    .setColor(Colors.Red)
+    .setTitle("❌ Error")
+    .setDescription(msg);
+}
+
+function noDataEmbed(action: "given" | "removed", filter?: string): EmbedBuilder {
+  return new EmbedBuilder()
+    .setColor(Colors.Yellow)
+    .setTitle(`No roles ${action} recorded`)
+    .setDescription(
+      filter
+        ? `No elevated roles have been **${action}** by **${filter}** since the bot joined.`
+        : `No elevated roles have been **${action}** in this server since the bot joined.`
+    )
+    .setFooter({ text: "The bot only tracks events after it joined the server." });
+}
+
+// ── Command handlers ───────────────────────────────────────────────────────────
+
+async function cmdPing(message: Message) {
+  const latency = Date.now() - message.createdTimestamp;
+  const embed = new EmbedBuilder()
+    .setColor(Colors.Green)
+    .setTitle("🏓 Pong!")
+    .addFields(
+      { name: "Bot latency", value: `${latency}ms`, inline: true },
+    )
+    .setTimestamp();
+  await message.reply({ embeds: [embed] });
+}
+
+async function cmdHelp(message: Message) {
+  const embed = new EmbedBuilder()
+    .setColor(0x5865f2)
+    .setTitle("Role Audit Bot — Help")
+    .setDescription("Tracks every time an elevated role is given or removed, so you always know who did what.")
+    .addFields(
+      {
+        name: "📋 Commands",
+        value: [
+          "`,ping` — Check if bot is online",
+          "`,help` — Show this menu",
+          "`,roles given <@user>` — Roles a mod has **given** to others",
+          "`,roles removed <@user>` — Roles a mod has **removed** from others",
+          "`,all roles given` — Full server log of role assignments",
+          "`,all roles removed` — Full server log of role removals",
+          "`,recent [n]` — Last N events, both given and removed (default 10, max 25)",
+          "`,server stats` — Server-wide role moderation summary",
+        ].join("\n"),
+      },
+      {
+        name: "🔍 What counts as elevated?",
+        value:
+          "`Administrator` • `Ban Members` • `Kick Members` • `Timeout Members`\n" +
+          "`Manage Roles` • `Manage Guild` • `Manage Channels` • `Manage Messages`\n" +
+          "`Manage Nicknames` • `Manage Webhooks` • `Manage Threads`",
+      },
+      {
+        name: "⚠️ Note",
+        value: "Only events that happen **after the bot joined** are tracked. Historical data is not available.",
+      },
+    )
+    .setFooter({ text: "Prefix: , (comma)" })
+    .setTimestamp();
+  await message.reply({ embeds: [embed] });
+}
+
+async function cmdRolesGiven(message: Message, args: string[]) {
+  if (!message.guild) {
+    await message.reply({ embeds: [errorEmbed("This command must be used in a server, not a DM.")] });
     return;
   }
 
   const userArg = args.join(" ").trim();
   if (!userArg) {
-    await message.reply(
-      "Usage: `,roles given @user` or `,roles given username`"
-    );
+    await message.reply({ embeds: [errorEmbed("Usage: `,roles given @user` or `,roles given username`")] });
     return;
   }
 
-  let targetId: string | null = null;
-
-  const mentionMatch = userArg.match(/^<@!?(\d+)>$/);
-  if (mentionMatch) {
-    targetId = mentionMatch[1];
-  } else if (/^\d+$/.test(userArg)) {
-    targetId = userArg;
-  }
+  const { id: targetId } = resolveUserArg(userArg);
 
   let records;
   if (targetId) {
     records = await db
       .select()
       .from(roleAssignmentsTable)
-      .where(
-        and(
-          eq(roleAssignmentsTable.guildId, guild.id),
-          eq(roleAssignmentsTable.executorId, targetId)
-        )
-      )
-      .orderBy(roleAssignmentsTable.assignedAt);
+      .where(and(
+        eq(roleAssignmentsTable.guildId, message.guild.id),
+        eq(roleAssignmentsTable.executorId, targetId),
+        eq(roleAssignmentsTable.action, "assigned"),
+      ))
+      .orderBy(desc(roleAssignmentsTable.assignedAt));
   } else {
     const nameSearch = userArg.toLowerCase();
     const all = await db
       .select()
       .from(roleAssignmentsTable)
-      .where(eq(roleAssignmentsTable.guildId, guild.id));
-    records = all.filter((r) =>
-      r.executorTag.toLowerCase().includes(nameSearch)
-    );
+      .where(and(
+        eq(roleAssignmentsTable.guildId, message.guild.id),
+        eq(roleAssignmentsTable.action, "assigned"),
+      ))
+      .orderBy(desc(roleAssignmentsTable.assignedAt));
+    records = all.filter((r) => r.executorTag.toLowerCase().includes(nameSearch));
   }
 
-  if (!records || records.length === 0) {
-    await message.reply(
-      `No elevated role assignments found for **${userArg}**.\n*(Note: only assignments made after the bot joined are tracked.)*`
-    );
+  if (!records.length) {
+    await message.reply({ embeds: [noDataEmbed("given", userArg)] });
     return;
   }
 
+  const executorTag = records[0].executorTag;
   const grouped = new Map<string, typeof records>();
   for (const r of records) {
-    const key = `${r.roleId}|${r.roleName}`;
+    const key = r.roleName;
     if (!grouped.has(key)) grouped.set(key, []);
     grouped.get(key)!.push(r);
   }
 
-  const executorTag = records[0].executorTag;
-  const lines: string[] = [
-    `**Elevated roles given by ${executorTag}:**`,
-    "",
-  ];
-
-  for (const [, entries] of grouped) {
-    const roleName = entries[0].roleName;
-    lines.push(`**${roleName}** — given to ${entries.length} user(s):`);
-    for (const e of entries.slice(0, 5)) {
-      lines.push(
-        `  • ${e.targetTag} — ${formatTimestamp(new Date(e.assignedAt))}`
-      );
-    }
-    if (entries.length > 5) {
-      lines.push(`  *(and ${entries.length - 5} more…)*`);
-    }
-    lines.push("");
+  const fields: { name: string; value: string }[] = [];
+  for (const [roleName, entries] of grouped) {
+    const preview = entries.slice(0, 5)
+      .map((e) => `• **${e.targetTag}** — ${ts(new Date(e.assignedAt))}`)
+      .join("\n");
+    const extra = entries.length > 5 ? `\n*…and ${entries.length - 5} more*` : "";
+    fields.push({ name: `@${roleName} (${entries.length}×)`, value: preview + extra });
   }
 
-  const output = lines.join("\n");
-  if (output.length > 1900) {
-    const chunks = output.match(/.{1,1900}/gs) ?? [];
-    for (const chunk of chunks) await message.channel.send(chunk);
-  } else {
-    await message.reply(output);
-  }
+  const embed = new EmbedBuilder()
+    .setColor(Colors.Orange)
+    .setTitle(`Roles given by ${executorTag}`)
+    .setDescription(`**${records.length}** total elevated role assignment(s)`)
+    .addFields(fields.slice(0, 10))
+    .setFooter({ text: "Showing elevated roles only" })
+    .setTimestamp();
+
+  await message.reply({ embeds: [embed] });
 }
 
-async function handleAllRolesGivenCommand(message: Message) {
-  const guild = message.guild;
-  if (!guild) {
-    await message.reply("This command must be used in a server, not a DM.");
+async function cmdRolesRemoved(message: Message, args: string[]) {
+  if (!message.guild) {
+    await message.reply({ embeds: [errorEmbed("This command must be used in a server, not a DM.")] });
+    return;
+  }
+
+  const userArg = args.join(" ").trim();
+  if (!userArg) {
+    await message.reply({ embeds: [errorEmbed("Usage: `,roles removed @user` or `,roles removed username`")] });
+    return;
+  }
+
+  const { id: targetId } = resolveUserArg(userArg);
+
+  let records;
+  if (targetId) {
+    records = await db
+      .select()
+      .from(roleAssignmentsTable)
+      .where(and(
+        eq(roleAssignmentsTable.guildId, message.guild.id),
+        eq(roleAssignmentsTable.executorId, targetId),
+        eq(roleAssignmentsTable.action, "removed"),
+      ))
+      .orderBy(desc(roleAssignmentsTable.assignedAt));
+  } else {
+    const nameSearch = userArg.toLowerCase();
+    const all = await db
+      .select()
+      .from(roleAssignmentsTable)
+      .where(and(
+        eq(roleAssignmentsTable.guildId, message.guild.id),
+        eq(roleAssignmentsTable.action, "removed"),
+      ))
+      .orderBy(desc(roleAssignmentsTable.assignedAt));
+    records = all.filter((r) => r.executorTag.toLowerCase().includes(nameSearch));
+  }
+
+  if (!records.length) {
+    await message.reply({ embeds: [noDataEmbed("removed", userArg)] });
+    return;
+  }
+
+  const executorTag = records[0].executorTag;
+  const grouped = new Map<string, typeof records>();
+  for (const r of records) {
+    if (!grouped.has(r.roleName)) grouped.set(r.roleName, []);
+    grouped.get(r.roleName)!.push(r);
+  }
+
+  const fields: { name: string; value: string }[] = [];
+  for (const [roleName, entries] of grouped) {
+    const preview = entries.slice(0, 5)
+      .map((e) => `• **${e.targetTag}** — ${ts(new Date(e.assignedAt))}`)
+      .join("\n");
+    const extra = entries.length > 5 ? `\n*…and ${entries.length - 5} more*` : "";
+    fields.push({ name: `@${roleName} (${entries.length}×)`, value: preview + extra });
+  }
+
+  const embed = new EmbedBuilder()
+    .setColor(Colors.Purple)
+    .setTitle(`Roles removed by ${executorTag}`)
+    .setDescription(`**${records.length}** total elevated role removal(s)`)
+    .addFields(fields.slice(0, 10))
+    .setFooter({ text: "Showing elevated roles only" })
+    .setTimestamp();
+
+  await message.reply({ embeds: [embed] });
+}
+
+async function cmdAllRolesGiven(message: Message) {
+  if (!message.guild) {
+    await message.reply({ embeds: [errorEmbed("This command must be used in a server.")] });
     return;
   }
 
   const records = await db
     .select()
     .from(roleAssignmentsTable)
-    .where(eq(roleAssignmentsTable.guildId, guild.id))
-    .orderBy(roleAssignmentsTable.assignedAt);
+    .where(and(
+      eq(roleAssignmentsTable.guildId, message.guild.id),
+      eq(roleAssignmentsTable.action, "assigned"),
+    ))
+    .orderBy(desc(roleAssignmentsTable.assignedAt))
+    .limit(25);
 
-  if (records.length === 0) {
-    await message.reply(
-      "No elevated role assignments have been recorded yet.\n*(The bot tracks assignments made after it joined.)*"
-    );
+  const total = await db
+    .select({ count: sql<number>`count(*)` })
+    .from(roleAssignmentsTable)
+    .where(and(
+      eq(roleAssignmentsTable.guildId, message.guild.id),
+      eq(roleAssignmentsTable.action, "assigned"),
+    ));
+
+  const totalCount = Number(total[0]?.count ?? 0);
+
+  if (!records.length) {
+    await message.reply({ embeds: [noDataEmbed("given")] });
     return;
   }
 
-  const lines: string[] = [
-    `**All elevated role assignments in ${guild.name}:**`,
-    `Total: ${records.length} assignment(s)`,
-    "",
-  ];
+  const lines = records.map(
+    (r) => `${ts(new Date(r.assignedAt))} **${r.executorTag}** → **${r.roleName}** → **${r.targetTag}**`
+  );
 
-  for (const r of records.slice(0, 30)) {
-    lines.push(
-      `${formatTimestamp(new Date(r.assignedAt))} — **${r.executorTag}** gave **${r.roleName}** to **${r.targetTag}**`
-    );
-  }
+  const embed = new EmbedBuilder()
+    .setColor(Colors.Orange)
+    .setTitle(`Role Assignments in ${message.guild.name}`)
+    .setDescription(lines.join("\n"))
+    .setFooter({
+      text: totalCount > 25
+        ? `Showing 25 of ${totalCount} — use \`,roles given @user\` to filter by mod`
+        : `${totalCount} total assignment(s)`,
+    })
+    .setTimestamp();
 
-  if (records.length > 30) {
-    lines.push(
-      `\n*(showing 30 of ${records.length} — use \`,roles given @user\` to filter by mod)*`
-    );
-  }
-
-  const output = lines.join("\n");
-  if (output.length > 1900) {
-    const chunks = output.match(/.{1,1900}/gs) ?? [];
-    for (const chunk of chunks) await message.channel.send(chunk);
-  } else {
-    await message.reply(output);
-  }
+  await message.reply({ embeds: [embed] });
 }
 
-async function handleHelpCommand(message: Message) {
-  const help = [
-    "**Role Audit Bot — Commands**",
-    "",
-    "`,roles given @user` — Shows all elevated roles this mod has given out, grouped by role.",
-    "`,all roles given` — Full server log: who gave what role, to whom, and when.",
-    "`,help` — Shows this help menu.",
-    "",
-    "**Tracked as elevated permissions:**",
-    "`Administrator` • `Ban Members` • `Kick Members` • `Timeout Members`",
-    "`Manage Roles` • `Manage Guild` • `Manage Channels` • `Manage Messages`",
-    "`Manage Nicknames` • `Manage Webhooks` • `Manage Threads`",
-    "",
-    "**Note:** Only role assignments made after the bot joined are tracked.",
-  ].join("\n");
+async function cmdAllRolesRemoved(message: Message) {
+  if (!message.guild) {
+    await message.reply({ embeds: [errorEmbed("This command must be used in a server.")] });
+    return;
+  }
 
-  await message.reply(help);
+  const records = await db
+    .select()
+    .from(roleAssignmentsTable)
+    .where(and(
+      eq(roleAssignmentsTable.guildId, message.guild.id),
+      eq(roleAssignmentsTable.action, "removed"),
+    ))
+    .orderBy(desc(roleAssignmentsTable.assignedAt))
+    .limit(25);
+
+  const total = await db
+    .select({ count: sql<number>`count(*)` })
+    .from(roleAssignmentsTable)
+    .where(and(
+      eq(roleAssignmentsTable.guildId, message.guild.id),
+      eq(roleAssignmentsTable.action, "removed"),
+    ));
+
+  const totalCount = Number(total[0]?.count ?? 0);
+
+  if (!records.length) {
+    await message.reply({ embeds: [noDataEmbed("removed")] });
+    return;
+  }
+
+  const lines = records.map(
+    (r) => `${ts(new Date(r.assignedAt))} **${r.executorTag}** → removed **${r.roleName}** from **${r.targetTag}**`
+  );
+
+  const embed = new EmbedBuilder()
+    .setColor(Colors.Purple)
+    .setTitle(`Role Removals in ${message.guild.name}`)
+    .setDescription(lines.join("\n"))
+    .setFooter({
+      text: totalCount > 25
+        ? `Showing 25 of ${totalCount} — use \`,roles removed @user\` to filter by mod`
+        : `${totalCount} total removal(s)`,
+    })
+    .setTimestamp();
+
+  await message.reply({ embeds: [embed] });
 }
+
+async function cmdRecent(message: Message, args: string[]) {
+  if (!message.guild) {
+    await message.reply({ embeds: [errorEmbed("This command must be used in a server.")] });
+    return;
+  }
+
+  const rawN = parseInt(args[0] ?? "10", 10);
+  const n = isNaN(rawN) || rawN < 1 ? 10 : Math.min(rawN, 25);
+
+  const records = await db
+    .select()
+    .from(roleAssignmentsTable)
+    .where(eq(roleAssignmentsTable.guildId, message.guild.id))
+    .orderBy(desc(roleAssignmentsTable.assignedAt))
+    .limit(n);
+
+  if (!records.length) {
+    await message.reply({
+      embeds: [
+        new EmbedBuilder()
+          .setColor(Colors.Yellow)
+          .setTitle("No events recorded")
+          .setDescription("No role events have been recorded in this server since the bot joined."),
+      ],
+    });
+    return;
+  }
+
+  const lines = records.map((r) => {
+    const icon = r.action === "assigned" ? "🟢" : "🔴";
+    const verb = r.action === "assigned" ? "gave" : "removed";
+    return `${icon} ${ts(new Date(r.assignedAt))} **${r.executorTag}** ${verb} **${r.roleName}** ${r.action === "assigned" ? "to" : "from"} **${r.targetTag}**`;
+  });
+
+  const embed = new EmbedBuilder()
+    .setColor(0x5865f2)
+    .setTitle(`Last ${records.length} role event(s)`)
+    .setDescription(lines.join("\n"))
+    .setFooter({ text: "🟢 = assigned  🔴 = removed" })
+    .setTimestamp();
+
+  await message.reply({ embeds: [embed] });
+}
+
+async function cmdServerStats(message: Message) {
+  if (!message.guild) {
+    await message.reply({ embeds: [errorEmbed("This command must be used in a server.")] });
+    return;
+  }
+
+  const guildId = message.guild.id;
+
+  const [totalAssigned, totalRemoved, topGivers, topRoles] = await Promise.all([
+    db.select({ count: sql<number>`count(*)` })
+      .from(roleAssignmentsTable)
+      .where(and(eq(roleAssignmentsTable.guildId, guildId), eq(roleAssignmentsTable.action, "assigned"))),
+
+    db.select({ count: sql<number>`count(*)` })
+      .from(roleAssignmentsTable)
+      .where(and(eq(roleAssignmentsTable.guildId, guildId), eq(roleAssignmentsTable.action, "removed"))),
+
+    db.select({
+        executorTag: roleAssignmentsTable.executorTag,
+        given: sql<number>`sum(case when action = 'assigned' then 1 else 0 end)`,
+        removed: sql<number>`sum(case when action = 'removed' then 1 else 0 end)`,
+        total: sql<number>`count(*)`,
+      })
+      .from(roleAssignmentsTable)
+      .where(eq(roleAssignmentsTable.guildId, guildId))
+      .groupBy(roleAssignmentsTable.executorTag)
+      .orderBy(desc(sql`count(*)`))
+      .limit(5),
+
+    db.select({
+        roleName: roleAssignmentsTable.roleName,
+        times: sql<number>`count(*)`,
+      })
+      .from(roleAssignmentsTable)
+      .where(and(eq(roleAssignmentsTable.guildId, guildId), eq(roleAssignmentsTable.action, "assigned")))
+      .groupBy(roleAssignmentsTable.roleName)
+      .orderBy(desc(sql`count(*)`))
+      .limit(5),
+  ]);
+
+  const assigned = Number(totalAssigned[0]?.count ?? 0);
+  const removed = Number(totalRemoved[0]?.count ?? 0);
+
+  const topGiversText = topGivers.length
+    ? topGivers.map((g, i) => `${i + 1}. **${g.executorTag}** — ${g.given} given, ${g.removed} removed`).join("\n")
+    : "No data yet.";
+
+  const topRolesText = topRoles.length
+    ? topRoles.map((r, i) => `${i + 1}. **${r.roleName}** — ${r.times}×`).join("\n")
+    : "No data yet.";
+
+  const embed = new EmbedBuilder()
+    .setColor(0x5865f2)
+    .setTitle(`📊 Server Stats — ${message.guild.name}`)
+    .addFields(
+      {
+        name: "Overall",
+        value: `🟢 **${assigned}** elevated roles given\n🔴 **${removed}** elevated roles removed\n📋 **${assigned + removed}** total events`,
+        inline: false,
+      },
+      {
+        name: "Top Moderators (by activity)",
+        value: topGiversText,
+        inline: false,
+      },
+      {
+        name: "Most Assigned Roles",
+        value: topRolesText,
+        inline: false,
+      },
+    )
+    .setFooter({ text: "Data collected since bot joined" })
+    .setTimestamp();
+
+  await message.reply({ embeds: [embed] });
+}
+
+// ── Role change tracking ───────────────────────────────────────────────────────
+
+async function recordRoleEvent(
+  guild: import("discord.js").Guild,
+  executorId: string,
+  executorTag: string,
+  targetId: string,
+  targetTag: string,
+  roleId: string,
+  roleName: string,
+  action: "assigned" | "removed",
+) {
+  await db.insert(roleAssignmentsTable).values({
+    guildId: guild.id,
+    executorId,
+    executorTag,
+    targetId,
+    targetTag,
+    roleId,
+    roleName,
+    action,
+  });
+
+  logger.info({ executor: executorTag, target: targetTag, role: roleName, action }, "Role event recorded");
+}
+
+// ── Bot startup ────────────────────────────────────────────────────────────────
 
 export async function startBot() {
   const token = process.env.DISCORD_BOT_TOKEN;
@@ -200,33 +534,31 @@ export async function startBot() {
   const client = new Client({
     intents: [
       GatewayIntentBits.Guilds,
-      GatewayIntentBits.GuildMembers,       // Privileged — must enable in Dev Portal
+      GatewayIntentBits.GuildMembers,    // Privileged — enable in Dev Portal
       GatewayIntentBits.GuildMessages,
-      GatewayIntentBits.MessageContent,     // Privileged — must enable in Dev Portal
+      GatewayIntentBits.MessageContent,  // Privileged — enable in Dev Portal
       GatewayIntentBits.GuildModeration,
     ],
   });
 
-  client.on(Events.ClientReady, () => {
+  client.once(Events.ClientReady, () => {
     logger.info({ tag: client.user?.tag }, "Discord bot logged in and ready");
   });
 
+  // ── Track role assignments and removals ──────────────────────────────────────
   client.on(Events.GuildMemberUpdate, async (oldMember, newMember) => {
     try {
       const guild = newMember.guild;
-      const addedRoles = newMember.roles.cache.filter(
-        (r) => !oldMember.roles.cache.has(r.id)
-      );
 
-      if (addedRoles.size === 0) return;
+      const addedRoles = newMember.roles.cache.filter((r) => !oldMember.roles.cache.has(r.id));
+      const removedRoles = oldMember.roles.cache.filter((r) => !newMember.roles.cache.has(r.id));
 
-      const elevatedRoles = addedRoles.filter((role) =>
-        hasElevatedPermission(role.permissions)
-      );
+      const elevatedAdded = addedRoles.filter((r) => hasElevatedPermission(r.permissions));
+      const elevatedRemoved = removedRoles.filter((r) => hasElevatedPermission(r.permissions));
 
-      if (elevatedRoles.size === 0) return;
+      if (elevatedAdded.size === 0 && elevatedRemoved.size === 0) return;
 
-      // Small delay so audit log is populated
+      // Wait for Discord audit log to populate
       await new Promise((r) => setTimeout(r, 1500));
 
       const auditLogs = await guild.fetchAuditLogs({
@@ -238,94 +570,95 @@ export async function startBot() {
         (e) => (e.target as GuildMember | null)?.id === newMember.id
       );
 
-      if (!entry || !entry.executor) {
-        logger.warn(
-          { targetId: newMember.id },
-          "Role update detected but no audit log entry found — bot may lack View Audit Log permission"
-        );
+      if (!entry?.executor) {
+        logger.warn({ targetId: newMember.id }, "Role change detected but no audit log entry — bot may lack View Audit Log permission");
         return;
       }
 
       const executor = entry.executor;
+      const executorTag = executor.tag ?? executor.username;
+      const targetTag = newMember.user.tag ?? newMember.user.username;
 
-      for (const [, role] of elevatedRoles) {
-        await db.insert(roleAssignmentsTable).values({
-          guildId: guild.id,
-          executorId: executor.id,
-          executorTag: executor.tag ?? executor.username,
-          targetId: newMember.id,
-          targetTag: newMember.user.tag ?? newMember.user.username,
-          roleId: role.id,
-          roleName: role.name,
-        });
+      for (const [, role] of elevatedAdded) {
+        await recordRoleEvent(guild, executor.id, executorTag, newMember.id, targetTag, role.id, role.name, "assigned");
+      }
 
-        logger.info(
-          {
-            executor: executor.tag ?? executor.username,
-            target: newMember.user.tag ?? newMember.user.username,
-            role: role.name,
-          },
-          "Elevated role assignment recorded"
-        );
+      for (const [, role] of elevatedRemoved) {
+        await recordRoleEvent(guild, executor.id, executorTag, newMember.id, targetTag, role.id, role.name, "removed");
       }
     } catch (err) {
       logger.error({ err }, "Error handling GuildMemberUpdate");
     }
   });
 
+  // ── Command router ───────────────────────────────────────────────────────────
   client.on(Events.MessageCreate, async (message) => {
     if (message.author.bot) return;
 
-    // Warn if MessageContent intent is missing — content will be empty string
-    if (message.content === "" && !message.author.bot) {
-      logger.warn(
-        "Received a message with empty content — 'Message Content Intent' may not be enabled in the Discord Developer Portal."
-      );
+    if (message.content === "") {
+      logger.warn("Empty message content — ensure 'Message Content Intent' is enabled in the Discord Developer Portal.");
       return;
     }
 
     if (!message.content.startsWith(",")) return;
 
-    const content = message.content.slice(1).trim();
-    const lower = content.toLowerCase();
+    const raw = message.content.slice(1).trim();
+    const lower = raw.toLowerCase();
 
-    logger.info({ author: message.author.tag, content: message.content }, "Command received");
+    logger.info({ author: message.author.tag, command: lower.slice(0, 40) }, "Command received");
 
     try {
       if (lower === "ping") {
-        await message.reply("🏓 Pong! Bot is alive and receiving messages.");
-      } else if (lower.startsWith("roles given ")) {
-        const args = content.slice("roles given ".length).trim().split(/\s+/);
-        await handleRolesGivenCommand(message, args);
-      } else if (lower === "all roles given") {
-        await handleAllRolesGivenCommand(message);
+        await cmdPing(message);
       } else if (lower === "help") {
-        await handleHelpCommand(message);
-      } else {
-        // Unknown command — silently ignore (no noise in channels)
-        logger.info({ lower }, "Unknown command — ignored");
+        await cmdHelp(message);
+      } else if (lower.startsWith("roles given ")) {
+        const args = raw.slice("roles given ".length).trim().split(/\s+/);
+        await cmdRolesGiven(message, args);
+      } else if (lower.startsWith("roles removed ")) {
+        const args = raw.slice("roles removed ".length).trim().split(/\s+/);
+        await cmdRolesRemoved(message, args);
+      } else if (lower === "all roles given") {
+        await cmdAllRolesGiven(message);
+      } else if (lower === "all roles removed") {
+        await cmdAllRolesRemoved(message);
+      } else if (lower.startsWith("recent")) {
+        const args = raw.slice("recent".length).trim().split(/\s+/);
+        await cmdRecent(message, args);
+      } else if (lower === "server stats") {
+        await cmdServerStats(message);
       }
+      // Unknown commands are silently ignored to avoid noise
     } catch (err: any) {
-      logger.error({ err: err?.message ?? err }, "Error handling command");
+      logger.error({ err: err?.message ?? String(err), stack: err?.stack }, "Command error");
       await message
-        .reply(`❌ Error: ${err?.message ?? "Something went wrong. Check bot permissions (Send Messages, Read Message History)."}`)
-        .catch((replyErr: any) => {
-          logger.error({ replyErr: replyErr?.message }, "Also failed to send error reply — bot may lack Send Messages permission in this channel");
-        });
+        .reply({
+          embeds: [
+            errorEmbed(
+              err?.message
+                ? `\`${err.message}\`\n\nIf this keeps happening, check the bot has **Send Messages** and **Read Message History** permissions in this channel.`
+                : "Something went wrong. Check the bot has correct channel permissions."
+            ),
+          ],
+        })
+        .catch((e: any) => logger.error({ e: e?.message }, "Failed to send error reply — missing Send Messages permission?"));
     }
   });
 
+  // ── Login ────────────────────────────────────────────────────────────────────
   try {
     await client.login(token);
   } catch (err: any) {
     if (err?.message?.includes("disallowed intents")) {
       logger.error(
-        "Discord bot failed: Privileged intents not enabled. " +
+        "Bot failed to start: Privileged intents not enabled. " +
         "Go to discord.com/developers/applications → your bot → Bot tab → " +
         "Privileged Gateway Intents → enable 'Server Members Intent' and 'Message Content Intent'."
       );
+    } else if (err?.message?.includes("TOKEN_INVALID")) {
+      logger.error("Bot failed to start: Invalid token. Check DISCORD_BOT_TOKEN.");
     } else {
-      throw err;
+      logger.error({ err: err?.message }, "Bot failed to start");
     }
   }
 }
