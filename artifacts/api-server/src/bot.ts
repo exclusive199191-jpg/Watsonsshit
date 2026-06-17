@@ -78,20 +78,20 @@ function errorEmbed(msg: string): EmbedBuilder {
 /**
  * Convert a raw drizzle/pg error into a short, user-safe string.
  * Drizzle wraps errors as "Failed query: <SQL>\nparams: <…>\n<actual PG message>".
- * We strip the SQL noise and surface only the meaningful line.
+ * We strip the SQL noise and surface only the meaningful PG line.
  */
 function friendlyError(err: any): string {
   const raw: string = err?.message ?? String(err);
 
-  // drizzle-orm error: pull out everything after the last blank line (the PG message)
   if (raw.startsWith("Failed query:")) {
-    // Lines after the params line contain the actual PG error
     const lines = raw.split("\n").map((l: string) => l.trim()).filter(Boolean);
-    // Skip lines that are the SQL or the params line
-    const pgLine = lines.find(
-      (l: string) => !l.startsWith("Failed query:") && !l.startsWith("params:") && !l.startsWith("select") && !l.startsWith("insert") && !l.startsWith("update") && !l.startsWith("delete")
-    );
-    if (pgLine) return pgLine;
+    // Everything after the "params:" line is the actual PG error message
+    const paramsIdx = lines.findIndex((l: string) => l.startsWith("params:"));
+    if (paramsIdx !== -1 && paramsIdx + 1 < lines.length) {
+      return lines.slice(paramsIdx + 1).join(" ");
+    }
+    // No params line found — take the last non-empty line (most likely the PG error)
+    return lines[lines.length - 1] ?? "An unexpected database error occurred.";
   }
 
   // Fallback: return first line only (avoids multi-line SQL dumps)
