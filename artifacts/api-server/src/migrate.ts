@@ -2,11 +2,15 @@ import { pool } from "@workspace/db";
 import { logger } from "./lib/logger";
 
 export async function runMigrations() {
+  if (!pool) {
+    logger.warn("DATABASE_URL not set — skipping migrations. Database commands will not work.");
+    return;
+  }
+
   const client = await pool.connect();
   try {
     logger.info("Running database migrations...");
 
-    // Create the role_assignments table if it doesn't exist
     await client.query(`
       CREATE TABLE IF NOT EXISTS role_assignments (
         id           SERIAL PRIMARY KEY,
@@ -22,22 +26,24 @@ export async function runMigrations() {
       )
     `);
 
-    // Add the action column to existing tables that were created without it
     await client.query(`
       ALTER TABLE role_assignments
         ADD COLUMN IF NOT EXISTS action TEXT NOT NULL DEFAULT 'assigned'
     `);
 
-    // Index for fast per-guild queries
     await client.query(`
       CREATE INDEX IF NOT EXISTS idx_role_assignments_guild
         ON role_assignments (guild_id, assigned_at DESC)
     `);
 
-    // Index for per-executor queries
     await client.query(`
       CREATE INDEX IF NOT EXISTS idx_role_assignments_executor
         ON role_assignments (guild_id, executor_id, assigned_at DESC)
+    `);
+
+    await client.query(`
+      CREATE INDEX IF NOT EXISTS idx_role_assignments_target
+        ON role_assignments (guild_id, target_id, assigned_at DESC)
     `);
 
     logger.info("Database migrations complete.");

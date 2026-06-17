@@ -124,6 +124,35 @@ async function cmdPing(message: Message) {
   await message.reply({ embeds: [embed] });
 }
 
+async function cmdStatus(message: Message, dbAvailable: boolean) {
+  const latency = Date.now() - message.createdTimestamp;
+  const guild = message.guild;
+
+  const dbStatus = dbAvailable ? "✅  Connected" : "❌  Not configured — set DATABASE_URL";
+  const guildName = guild?.name ?? "Unknown";
+  const guildMembers = guild?.memberCount ?? "?";
+
+  const embed = new EmbedBuilder()
+    .setColor(dbAvailable ? Colors.Green : Colors.Red)
+    .setTitle("Bot Status")
+    .addFields(
+      { name: "Database", value: dbStatus, inline: false },
+      { name: "Bot latency", value: `${latency}ms`, inline: true },
+      { name: "WebSocket ping", value: `${message.client.ws.ping}ms`, inline: true },
+      { name: "Server", value: guildName, inline: true },
+      { name: "Members", value: String(guildMembers), inline: true },
+      { name: "Uptime", value: `${Math.floor((message.client.uptime ?? 0) / 60000)}m`, inline: true },
+    )
+    .setFooter({
+      text: dbAvailable
+        ? "All systems operational."
+        : "DATABASE_URL is not set in Railway. Add a PostgreSQL service and set DATABASE_URL.",
+    })
+    .setTimestamp();
+
+  await message.reply({ embeds: [embed] });
+}
+
 async function cmdHelp(message: Message) {
   const line = "─────────────────────────────────────";
 
@@ -147,7 +176,7 @@ async function cmdHelp(message: Message) {
           "`,myactivity`  —  Your own give/remove counts and recent events",
         ].join("\n"),
       },
-      { name: line, value: " " },
+      { name: line, value: "\u200b" },
       {
         name: "SERVER LOGS",
         value: [
@@ -158,7 +187,7 @@ async function cmdHelp(message: Message) {
           "`,active [days]`  —  Most active moderators in the last N days  *(default 7)*",
         ].join("\n"),
       },
-      { name: line, value: " " },
+      { name: line, value: "\u200b" },
       {
         name: "SEARCH  &  FILTER",
         value: [
@@ -169,7 +198,7 @@ async function cmdHelp(message: Message) {
           "`,audit`  —  Flag moderators who assigned 5+ roles within any 10-minute window",
         ].join("\n"),
       },
-      { name: line, value: " " },
+      { name: line, value: "\u200b" },
       {
         name: "STATS  &  EXPORT",
         value: [
@@ -178,7 +207,16 @@ async function cmdHelp(message: Message) {
           "`,export`  —  Download the complete role log as a plain-text file",
         ].join("\n"),
       },
-      { name: line, value: " " },
+      { name: line, value: "\u200b" },
+      {
+        name: "UTILITIES",
+        value: [
+          "`,status`  —  Show database connection, latency, and bot health",
+          "`,ping`  —  Bot latency",
+          "`,help`  —  This command reference",
+        ].join("\n"),
+      },
+      { name: line, value: "\u200b" },
       {
         name: "TRACKED PERMISSIONS",
         value:
@@ -1265,8 +1303,14 @@ export async function startBot() {
   client.on(Events.MessageCreate, async (message) => {
     if (message.author.bot) return;
 
+    // Message Content Intent is not enabled in the Discord Developer Portal.
+    // message.content will be empty for every message — commands cannot work.
     if (message.content === "") {
-      logger.warn("Empty message content — ensure 'Message Content Intent' is enabled in the Discord Developer Portal.");
+      logger.warn(
+        "Message Content Intent is NOT enabled. " +
+        "Go to discord.com/developers/applications → your app → Bot → " +
+        "Privileged Gateway Intents → enable 'Message Content Intent' and save."
+      );
       return;
     }
 
@@ -1282,6 +1326,20 @@ export async function startBot() {
         await cmdPing(message);
       } else if (lower === "help") {
         await cmdHelp(message);
+      } else if (lower === "status") {
+        await cmdStatus(message, !!db);
+
+      // ── Database guard — all commands below require DATABASE_URL ────────────
+      } else if (!db) {
+        await message.reply({
+          embeds: [
+            errorEmbed(
+              "**Database not configured.**\n\n" +
+              "Set `DATABASE_URL` in your Railway environment variables and redeploy.\n" +
+              "Run `,status` for more details."
+            ),
+          ],
+        });
 
       // ── Lookup commands ─────────────────────────────────────────────────────
       } else if (lower.startsWith("roles given ")) {
