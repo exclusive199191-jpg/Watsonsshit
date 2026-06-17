@@ -180,31 +180,84 @@ async function cmdRolesGiven(message: Message, args: string[]) {
   }
 
   const executorTag = records[0].executorTag;
+  const executorId = records[0].executorId;
+
+  // Group by roleId so each unique role gets its own section
   const grouped = new Map<string, typeof records>();
   for (const r of records) {
-    const key = r.roleName;
-    if (!grouped.has(key)) grouped.set(key, []);
-    grouped.get(key)!.push(r);
+    if (!grouped.has(r.roleId)) grouped.set(r.roleId, []);
+    grouped.get(r.roleId)!.push(r);
   }
 
-  const fields: { name: string; value: string }[] = [];
-  for (const [roleName, entries] of grouped) {
-    const preview = entries.slice(0, 5)
-      .map((e) => `• **${e.targetTag}** — ${ts(new Date(e.assignedAt))}`)
-      .join("\n");
-    const extra = entries.length > 5 ? `\n*…and ${entries.length - 5} more*` : "";
-    fields.push({ name: `@${roleName} (${entries.length}×)`, value: preview + extra });
+  // Fetch live role permissions from the guild cache
+  const guild = message.guild;
+  await guild.roles.fetch(); // ensure cache is populated
+
+  const fields: { name: string; value: string; inline: boolean }[] = [];
+
+  for (const [roleId, entries] of grouped) {
+    const roleName = entries[0].roleName;
+
+    // Look up live permissions for this role
+    const liveRole = guild.roles.cache.get(roleId);
+    let permsText: string;
+    if (liveRole) {
+      const elevatedPerms = getElevatedPermNames(liveRole.permissions);
+      permsText = elevatedPerms.length
+        ? elevatedPerms.map((p) => `\`${p}\``).join(", ")
+        : "*No elevated permissions currently*";
+    } else {
+      permsText = "*Role no longer exists in server*";
+    }
+
+    // Build the recipient list
+    const recipientLines = entries.slice(0, 8).map(
+      (e) => `• **${e.targetTag}** — ${ts(new Date(e.assignedAt))}`
+    );
+    if (entries.length > 8) {
+      recipientLines.push(`*…and ${entries.length - 8} more*`);
+    }
+
+    const fieldValue = [
+      `**Permissions:** ${permsText}`,
+      "",
+      ...recipientLines,
+    ].join("\n");
+
+    fields.push({
+      name: `🔐 @${roleName}  (given ${entries.length}×)`,
+      value: fieldValue,
+      inline: false,
+    });
   }
 
-  const embed = new EmbedBuilder()
-    .setColor(Colors.Orange)
-    .setTitle(`Roles given by ${executorTag}`)
-    .setDescription(`**${records.length}** total elevated role assignment(s)`)
-    .addFields(fields.slice(0, 10))
-    .setFooter({ text: "Showing elevated roles only" })
-    .setTimestamp();
+  // Discord limits: max 10 fields per embed, max 1024 chars per field value
+  // If there are many roles, split across multiple embeds
+  const FIELDS_PER_EMBED = 5;
+  const chunks: typeof fields[] = [];
+  for (let i = 0; i < fields.length; i += FIELDS_PER_EMBED) {
+    chunks.push(fields.slice(i, i + FIELDS_PER_EMBED));
+  }
 
-  await message.reply({ embeds: [embed] });
+  for (let i = 0; i < chunks.length; i++) {
+    const embed = new EmbedBuilder()
+      .setColor(Colors.Orange)
+      .setTitle(i === 0 ? `Roles given by ${executorTag}` : `Roles given by ${executorTag} (cont.)`)
+      .setDescription(
+        i === 0
+          ? `**${records.length}** elevated role assignment(s) across **${grouped.size}** unique role(s)\n<@${executorId}>`
+          : null
+      )
+      .addFields(chunks[i])
+      .setFooter({ text: "Showing elevated roles only" })
+      .setTimestamp();
+
+    if (i === 0) {
+      await message.reply({ embeds: [embed] });
+    } else {
+      await message.channel.send({ embeds: [embed] });
+    }
+  }
 }
 
 async function cmdRolesRemoved(message: Message, args: string[]) {
