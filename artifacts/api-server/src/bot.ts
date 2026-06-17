@@ -1319,6 +1319,9 @@ export async function startBot() {
 
     logger.info({ author: message.author.tag, command: lower.slice(0, 40) }, "Command received");
 
+    const RETRYABLE_CODES = new Set(["ETIMEDOUT", "ECONNRESET", "EPIPE", "ECONNREFUSED", "ENOTFOUND"]);
+
+    for (let attempt = 1; attempt <= 2; attempt++) {
     try {
       if (lower === "ping") {
         await cmdPing(message);
@@ -1402,11 +1405,18 @@ export async function startBot() {
         await cmdExport(message);
       }
       // Unknown commands are silently ignored to avoid noise
+      break; // success — exit retry loop
     } catch (err: any) {
+      const code = err?.cause?.code ?? err?.code;
+      if (RETRYABLE_CODES.has(code) && attempt === 1) {
+        logger.warn({ code, command: lower.slice(0, 40) }, "DB connection error — retrying command once...");
+        await new Promise((r) => setTimeout(r, 400));
+        continue; // retry
+      }
       logger.error({
         err: err?.message ?? String(err),
         cause: err?.cause?.message ?? err?.cause,
-        code: err?.cause?.code ?? err?.code,
+        code,
         stack: err?.stack,
       }, "Command error");
       const clean = friendlyError(err);
@@ -1417,7 +1427,9 @@ export async function startBot() {
           ],
         })
         .catch((e: any) => logger.error({ e: e?.message }, "Failed to send error reply — missing Send Messages permission?"));
+      break; // error handled — exit retry loop
     }
+    } // end retry loop
   });
 
   // ── Login ────────────────────────────────────────────────────────────────────

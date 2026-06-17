@@ -19,8 +19,11 @@ export const pool = url
       // Keep connections alive so Railway/cloud infra doesn't silently kill them
       keepAlive: true,
       keepAliveInitialDelayMillis: 10_000,
-      // Discard idle connections after 30s so the pool never hands out a dead one
-      idleTimeoutMillis: 30_000,
+      // Drop idle connections after 1s — always use a fresh connection for the next query.
+      // This is the most reliable way to avoid ETIMEDOUT on Railway, which kills idle
+      // TCP connections at the infra level. A Discord bot has very low concurrency so
+      // the reconnect overhead (~50ms) is not a problem.
+      idleTimeoutMillis: 1_000,
       // Fail fast if the DB is unreachable rather than hanging forever
       connectionTimeoutMillis: 10_000,
       // Small pool — this is a Discord bot, not a web server
