@@ -127,23 +127,57 @@ async function cmdHelp(message: Message) {
   const embed = new EmbedBuilder()
     .setColor(0x5865f2)
     .setTitle("Role Audit Bot — Help")
-    .setDescription("Tracks every time an elevated role is given or removed, so you always know who did what.")
+    .setDescription("Tracks every elevated role assignment and removal. Prefix: `,` (comma)")
     .addFields(
       {
-        name: "📋 Commands",
+        name: "🔎 Lookup Commands",
         value: [
-          "`,ping` — Check if bot is online",
-          "`,help` — Show this menu",
-          "`,roles given <@user>` — Roles a mod has **given** to others",
-          "`,roles removed <@user>` — Roles a mod has **removed** from others",
-          "`,all roles given` — Full server log of role assignments",
-          "`,all roles removed` — Full server log of role removals",
-          "`,recent [n]` — Last N events, both given and removed (default 10, max 25)",
-          "`,server stats` — Server-wide role moderation summary",
+          "`,roles given <@user>` — Roles a mod **gave** to others",
+          "`,roles removed <@user>` — Roles a mod **removed** from others",
+          "`,lookup <@user>` — Who gave/removed elevated roles **to** a user",
+          "`,timeline <@user>` — Chronological role history for a user",
+          "`,mod <@user>` — Full moderator profile & stats",
+          "`,between <@user1> <@user2>` — All role interactions between two users",
+          "`,myactivity` — Your own role moderation stats",
         ].join("\n"),
       },
       {
-        name: "🔍 What counts as elevated?",
+        name: "📋 Server Log Commands",
+        value: [
+          "`,all roles given` — Latest 25 role assignments",
+          "`,all roles removed` — Latest 25 role removals",
+          "`,recent [n]` — Last N events, given + removed (default 10, max 50)",
+          "`,history [days]` — Activity in the last N days (default 7)",
+          "`,active [days]` — Most active mods in the last N days (default 7)",
+        ].join("\n"),
+      },
+      {
+        name: "🔍 Search & Filter",
+        value: [
+          "`,search <rolename>` — All events for a specific role",
+          "`,find <name>` — Search across all usernames/tags",
+          "`,whohas <rolename>` — Who currently holds a role with elevated perms",
+          "`,undone [hours]` — Roles given then removed within N hours (default 24)",
+          "`,audit` — Detect suspicious rapid role activity",
+        ].join("\n"),
+      },
+      {
+        name: "📊 Stats & Export",
+        value: [
+          "`,server stats` — Server-wide role moderation summary",
+          "`,top [n]` — Top N most active moderators (default 10)",
+          "`,export` — Download the full role log as a text file",
+        ].join("\n"),
+      },
+      {
+        name: "⚙️ Utility",
+        value: [
+          "`,ping` — Check if bot is online",
+          "`,help` — Show this menu",
+        ].join("\n"),
+      },
+      {
+        name: "🔐 What counts as elevated?",
         value:
           "`Administrator` • `Ban Members` • `Kick Members` • `Timeout Members`\n" +
           "`Manage Roles` • `Manage Guild` • `Manage Channels` • `Manage Messages`\n" +
@@ -151,10 +185,9 @@ async function cmdHelp(message: Message) {
       },
       {
         name: "⚠️ Note",
-        value: "Only events that happen **after the bot joined** are tracked. Historical data is not available.",
+        value: "Only events after the bot joined are tracked. Historical data is not available.",
       },
     )
-    .setFooter({ text: "Prefix: , (comma)" })
     .setTimestamp();
   await message.reply({ embeds: [embed] });
 }
@@ -572,6 +605,559 @@ async function cmdServerStats(message: Message) {
   await message.reply({ embeds: [embed] });
 }
 
+// ── New command handlers ───────────────────────────────────────────────────────
+
+async function cmdLookup(message: Message, args: string[]) {
+  if (!message.guild) {
+    await message.reply({ embeds: [errorEmbed("This command must be used in a server.")] });
+    return;
+  }
+  const userArg = args.join(" ").trim();
+  if (!userArg) {
+    await message.reply({ embeds: [errorEmbed("Usage: `,lookup @user` — shows who gave or removed elevated roles **to** that user.")] });
+    return;
+  }
+  const { id: targetId } = resolveUserArg(userArg);
+  let records;
+  if (targetId) {
+    records = await db.select().from(roleAssignmentsTable)
+      .where(and(eq(roleAssignmentsTable.guildId, message.guild.id), eq(roleAssignmentsTable.targetId, targetId)))
+      .orderBy(desc(roleAssignmentsTable.assignedAt));
+  } else {
+    const nameSearch = userArg.toLowerCase();
+    const all = await db.select().from(roleAssignmentsTable)
+      .where(eq(roleAssignmentsTable.guildId, message.guild.id))
+      .orderBy(desc(roleAssignmentsTable.assignedAt));
+    records = all.filter((r) => r.targetTag.toLowerCase().includes(nameSearch));
+  }
+  if (!records.length) {
+    await message.reply({ embeds: [new EmbedBuilder().setColor(Colors.Yellow).setTitle("No records found").setDescription(`No elevated role events found for **${userArg}**.`).setFooter({ text: "Only tracked after the bot joined." })] });
+    return;
+  }
+  const targetTag = records[0].targetTag;
+  const lines = records.slice(0, 20).map((r) => {
+    const icon = r.action === "assigned" ? "🟢" : "🔴";
+    const verb = r.action === "assigned" ? "gave" : "removed";
+    return `${icon} ${ts(new Date(r.assignedAt))} **${r.executorTag}** ${verb} **${r.roleName}**`;
+  });
+  if (records.length > 20) lines.push(`*…and ${records.length - 20} more events*`);
+  const given = records.filter((r) => r.action === "assigned").length;
+  const removed = records.filter((r) => r.action === "removed").length;
+  const embed = new EmbedBuilder()
+    .setColor(0x5865f2)
+    .setTitle(`Role history for ${targetTag}`)
+    .setDescription(lines.join("\n"))
+    .addFields({ name: "Summary", value: `🟢 ${given} role(s) given  •  🔴 ${removed} role(s) removed`, inline: false })
+    .setFooter({ text: `${records.length} total event(s) — 🟢 given  🔴 removed` })
+    .setTimestamp();
+  await message.reply({ embeds: [embed] });
+}
+
+async function cmdTimeline(message: Message, args: string[]) {
+  if (!message.guild) {
+    await message.reply({ embeds: [errorEmbed("This command must be used in a server.")] });
+    return;
+  }
+  const userArg = args.join(" ").trim();
+  if (!userArg) {
+    await message.reply({ embeds: [errorEmbed("Usage: `,timeline @user` — chronological role history for that user.")] });
+    return;
+  }
+  const { id: targetId } = resolveUserArg(userArg);
+  let records;
+  if (targetId) {
+    records = await db.select().from(roleAssignmentsTable)
+      .where(and(eq(roleAssignmentsTable.guildId, message.guild.id), eq(roleAssignmentsTable.targetId, targetId)))
+      .orderBy(roleAssignmentsTable.assignedAt);
+  } else {
+    const nameSearch = userArg.toLowerCase();
+    const all = await db.select().from(roleAssignmentsTable)
+      .where(eq(roleAssignmentsTable.guildId, message.guild.id))
+      .orderBy(roleAssignmentsTable.assignedAt);
+    records = all.filter((r) => r.targetTag.toLowerCase().includes(nameSearch));
+  }
+  if (!records.length) {
+    await message.reply({ embeds: [new EmbedBuilder().setColor(Colors.Yellow).setTitle("No timeline data").setDescription(`No events found for **${userArg}**.`)] });
+    return;
+  }
+  const targetTag = records[0].targetTag;
+  const lines = records.slice(0, 25).map((r) => {
+    const icon = r.action === "assigned" ? "🟢" : "🔴";
+    return `${icon} ${ts(new Date(r.assignedAt))} **${r.roleName}** — by **${r.executorTag}**`;
+  });
+  if (records.length > 25) lines.push(`*…and ${records.length - 25} more*`);
+  const embed = new EmbedBuilder()
+    .setColor(0x5865f2)
+    .setTitle(`📅 Timeline for ${targetTag}`)
+    .setDescription(lines.join("\n"))
+    .setFooter({ text: `${records.length} total event(s) — oldest first — 🟢 given  🔴 removed` })
+    .setTimestamp();
+  await message.reply({ embeds: [embed] });
+}
+
+async function cmdMod(message: Message, args: string[]) {
+  if (!message.guild) {
+    await message.reply({ embeds: [errorEmbed("This command must be used in a server.")] });
+    return;
+  }
+  const userArg = args.join(" ").trim();
+  if (!userArg) {
+    await message.reply({ embeds: [errorEmbed("Usage: `,mod @user` — full moderator profile.")] });
+    return;
+  }
+  const { id: executorId } = resolveUserArg(userArg);
+  let records;
+  if (executorId) {
+    records = await db.select().from(roleAssignmentsTable)
+      .where(and(eq(roleAssignmentsTable.guildId, message.guild.id), eq(roleAssignmentsTable.executorId, executorId)))
+      .orderBy(desc(roleAssignmentsTable.assignedAt));
+  } else {
+    const nameSearch = userArg.toLowerCase();
+    const all = await db.select().from(roleAssignmentsTable)
+      .where(eq(roleAssignmentsTable.guildId, message.guild.id))
+      .orderBy(desc(roleAssignmentsTable.assignedAt));
+    records = all.filter((r) => r.executorTag.toLowerCase().includes(nameSearch));
+  }
+  if (!records.length) {
+    await message.reply({ embeds: [new EmbedBuilder().setColor(Colors.Yellow).setTitle("No data for this mod").setDescription(`No role events found for **${userArg}**.`)] });
+    return;
+  }
+  const executorTag = records[0].executorTag;
+  const eId = records[0].executorId;
+  const given = records.filter((r) => r.action === "assigned");
+  const removed = records.filter((r) => r.action === "removed");
+  const roleFreq = new Map<string, number>();
+  for (const r of given) roleFreq.set(r.roleName, (roleFreq.get(r.roleName) ?? 0) + 1);
+  const topRoles = [...roleFreq.entries()].sort((a, b) => b[1] - a[1]).slice(0, 3);
+  const targetFreq = new Map<string, number>();
+  for (const r of records) targetFreq.set(r.targetTag, (targetFreq.get(r.targetTag) ?? 0) + 1);
+  const topTargets = [...targetFreq.entries()].sort((a, b) => b[1] - a[1]).slice(0, 3);
+  const recentLines = records.slice(0, 5).map((r) => {
+    const icon = r.action === "assigned" ? "🟢" : "🔴";
+    return `${icon} ${ts(new Date(r.assignedAt))} **${r.roleName}** → **${r.targetTag}**`;
+  });
+  const embed = new EmbedBuilder()
+    .setColor(Colors.Orange)
+    .setTitle(`🛡️ Mod Profile — ${executorTag}`)
+    .setDescription(`<@${eId}>`)
+    .addFields(
+      { name: "📊 Activity", value: `🟢 **${given.length}** roles given\n🔴 **${removed.length}** roles removed\n📋 **${records.length}** total events`, inline: true },
+      { name: "🔝 Top Roles Given", value: topRoles.length ? topRoles.map(([n, c]) => `**${n}** (${c}×)`).join("\n") : "None", inline: true },
+      { name: "👥 Top Recipients", value: topTargets.length ? topTargets.map(([n, c]) => `**${n}** (${c}×)`).join("\n") : "None", inline: true },
+      { name: "🕐 Recent Activity", value: recentLines.join("\n") || "None", inline: false },
+    )
+    .setFooter({ text: `First event: ${new Date(records[records.length - 1].assignedAt).toLocaleDateString()}` })
+    .setTimestamp();
+  await message.reply({ embeds: [embed] });
+}
+
+async function cmdBetween(message: Message, args: string[]) {
+  if (!message.guild) {
+    await message.reply({ embeds: [errorEmbed("This command must be used in a server.")] });
+    return;
+  }
+  if (args.length < 2) {
+    await message.reply({ embeds: [errorEmbed("Usage: `,between @user1 @user2` — all role interactions between two users.")] });
+    return;
+  }
+  const { id: id1 } = resolveUserArg(args[0]);
+  const { id: id2 } = resolveUserArg(args[1]);
+  if (!id1 || !id2) {
+    await message.reply({ embeds: [errorEmbed("Please mention or provide IDs for both users.")] });
+    return;
+  }
+  const all = await db.select().from(roleAssignmentsTable)
+    .where(eq(roleAssignmentsTable.guildId, message.guild.id))
+    .orderBy(desc(roleAssignmentsTable.assignedAt));
+  const records = all.filter((r) =>
+    (r.executorId === id1 && r.targetId === id2) || (r.executorId === id2 && r.targetId === id1)
+  );
+  if (!records.length) {
+    await message.reply({ embeds: [new EmbedBuilder().setColor(Colors.Yellow).setTitle("No interactions found").setDescription("No role events between those two users.")] });
+    return;
+  }
+  const lines = records.slice(0, 20).map((r) => {
+    const icon = r.action === "assigned" ? "🟢" : "🔴";
+    const verb = r.action === "assigned" ? "gave" : "removed";
+    return `${icon} ${ts(new Date(r.assignedAt))} **${r.executorTag}** ${verb} **${r.roleName}** ${r.action === "assigned" ? "to" : "from"} **${r.targetTag}**`;
+  });
+  if (records.length > 20) lines.push(`*…and ${records.length - 20} more*`);
+  const tag1 = records.find((r) => r.executorId === id1)?.executorTag ?? records.find((r) => r.targetId === id1)?.targetTag ?? id1;
+  const tag2 = records.find((r) => r.executorId === id2)?.executorTag ?? records.find((r) => r.targetId === id2)?.targetTag ?? id2;
+  const embed = new EmbedBuilder()
+    .setColor(0x5865f2)
+    .setTitle(`⚔️ Interactions: ${tag1} ↔ ${tag2}`)
+    .setDescription(lines.join("\n"))
+    .setFooter({ text: `${records.length} total event(s)` })
+    .setTimestamp();
+  await message.reply({ embeds: [embed] });
+}
+
+async function cmdMyActivity(message: Message) {
+  if (!message.guild) {
+    await message.reply({ embeds: [errorEmbed("This command must be used in a server.")] });
+    return;
+  }
+  const userId = message.author.id;
+  const [asExecutor, asTarget] = await Promise.all([
+    db.select().from(roleAssignmentsTable)
+      .where(and(eq(roleAssignmentsTable.guildId, message.guild.id), eq(roleAssignmentsTable.executorId, userId)))
+      .orderBy(desc(roleAssignmentsTable.assignedAt)),
+    db.select().from(roleAssignmentsTable)
+      .where(and(eq(roleAssignmentsTable.guildId, message.guild.id), eq(roleAssignmentsTable.targetId, userId)))
+      .orderBy(desc(roleAssignmentsTable.assignedAt)),
+  ]);
+  const given = asExecutor.filter((r) => r.action === "assigned").length;
+  const removed = asExecutor.filter((r) => r.action === "removed").length;
+  const receivedGiven = asTarget.filter((r) => r.action === "assigned").length;
+  const receivedRemoved = asTarget.filter((r) => r.action === "removed").length;
+  const recentDone = asExecutor.slice(0, 3).map((r) => {
+    const icon = r.action === "assigned" ? "🟢" : "🔴";
+    const verb = r.action === "assigned" ? "gave" : "removed";
+    return `${icon} ${ts(new Date(r.assignedAt))} ${verb} **${r.roleName}** → **${r.targetTag}**`;
+  });
+  const recentReceived = asTarget.slice(0, 3).map((r) => {
+    const icon = r.action === "assigned" ? "🟢" : "🔴";
+    return `${icon} ${ts(new Date(r.assignedAt))} **${r.roleName}** by **${r.executorTag}**`;
+  });
+  const embed = new EmbedBuilder()
+    .setColor(0x5865f2)
+    .setTitle(`📊 Your Activity — ${message.author.tag}`)
+    .addFields(
+      { name: "🛡️ As Moderator", value: `🟢 **${given}** given  •  🔴 **${removed}** removed\n${recentDone.join("\n") || "*No activity*"}`, inline: false },
+      { name: "👤 Roles Received", value: `🟢 **${receivedGiven}** given to you  •  🔴 **${receivedRemoved}** removed from you\n${recentReceived.join("\n") || "*No activity*"}`, inline: false },
+    )
+    .setTimestamp();
+  await message.reply({ embeds: [embed] });
+}
+
+async function cmdSearch(message: Message, args: string[]) {
+  if (!message.guild) {
+    await message.reply({ embeds: [errorEmbed("This command must be used in a server.")] });
+    return;
+  }
+  const query = args.join(" ").trim().toLowerCase();
+  if (!query) {
+    await message.reply({ embeds: [errorEmbed("Usage: `,search <rolename>` — find all events for a role.")] });
+    return;
+  }
+  const all = await db.select().from(roleAssignmentsTable)
+    .where(eq(roleAssignmentsTable.guildId, message.guild.id))
+    .orderBy(desc(roleAssignmentsTable.assignedAt));
+  const records = all.filter((r) => r.roleName.toLowerCase().includes(query));
+  if (!records.length) {
+    await message.reply({ embeds: [new EmbedBuilder().setColor(Colors.Yellow).setTitle("No results").setDescription(`No role events found matching **${query}**.`)] });
+    return;
+  }
+  const given = records.filter((r) => r.action === "assigned").length;
+  const removed = records.filter((r) => r.action === "removed").length;
+  const lines = records.slice(0, 20).map((r) => {
+    const icon = r.action === "assigned" ? "🟢" : "🔴";
+    const verb = r.action === "assigned" ? "gave" : "removed";
+    return `${icon} ${ts(new Date(r.assignedAt))} **${r.executorTag}** ${verb} **${r.roleName}** ${r.action === "assigned" ? "to" : "from"} **${r.targetTag}**`;
+  });
+  if (records.length > 20) lines.push(`*…and ${records.length - 20} more*`);
+  const embed = new EmbedBuilder()
+    .setColor(Colors.Blue)
+    .setTitle(`🔍 Search: "${query}"`)
+    .setDescription(lines.join("\n"))
+    .setFooter({ text: `${records.length} result(s) — 🟢 ${given} given  🔴 ${removed} removed` })
+    .setTimestamp();
+  await message.reply({ embeds: [embed] });
+}
+
+async function cmdFind(message: Message, args: string[]) {
+  if (!message.guild) {
+    await message.reply({ embeds: [errorEmbed("This command must be used in a server.")] });
+    return;
+  }
+  const query = args.join(" ").trim().toLowerCase();
+  if (!query) {
+    await message.reply({ embeds: [errorEmbed("Usage: `,find <name>` — search across all usernames.")] });
+    return;
+  }
+  const all = await db.select().from(roleAssignmentsTable)
+    .where(eq(roleAssignmentsTable.guildId, message.guild.id))
+    .orderBy(desc(roleAssignmentsTable.assignedAt));
+  const records = all.filter((r) =>
+    r.executorTag.toLowerCase().includes(query) || r.targetTag.toLowerCase().includes(query)
+  );
+  if (!records.length) {
+    await message.reply({ embeds: [new EmbedBuilder().setColor(Colors.Yellow).setTitle("No results").setDescription(`No events matched **"${query}"** in any username.`)] });
+    return;
+  }
+  const lines = records.slice(0, 20).map((r) => {
+    const icon = r.action === "assigned" ? "🟢" : "🔴";
+    const verb = r.action === "assigned" ? "gave" : "removed";
+    return `${icon} ${ts(new Date(r.assignedAt))} **${r.executorTag}** ${verb} **${r.roleName}** → **${r.targetTag}**`;
+  });
+  if (records.length > 20) lines.push(`*…and ${records.length - 20} more*`);
+  const embed = new EmbedBuilder()
+    .setColor(Colors.Blue)
+    .setTitle(`🔎 Find: "${query}"`)
+    .setDescription(lines.join("\n"))
+    .setFooter({ text: `${records.length} matching event(s)` })
+    .setTimestamp();
+  await message.reply({ embeds: [embed] });
+}
+
+async function cmdWhoHas(message: Message, args: string[]) {
+  if (!message.guild) {
+    await message.reply({ embeds: [errorEmbed("This command must be used in a server.")] });
+    return;
+  }
+  const query = args.join(" ").trim().toLowerCase();
+  if (!query) {
+    await message.reply({ embeds: [errorEmbed("Usage: `,whohas <rolename>` — see who currently holds that role.")] });
+    return;
+  }
+  await message.guild.members.fetch();
+  await message.guild.roles.fetch();
+  const matchingRoles = message.guild.roles.cache.filter((r) => r.name.toLowerCase().includes(query) && hasElevatedPermission(r.permissions));
+  if (!matchingRoles.size) {
+    await message.reply({ embeds: [new EmbedBuilder().setColor(Colors.Yellow).setTitle("No elevated roles found").setDescription(`No roles matching **"${query}"** with elevated permissions exist in this server.`)] });
+    return;
+  }
+  const fields: { name: string; value: string; inline: boolean }[] = [];
+  for (const [, role] of matchingRoles) {
+    const members = role.members;
+    const perms = getElevatedPermNames(role.permissions).map((p) => `\`${p}\``).join(", ");
+    const memberList = members.size
+      ? members.map((m) => `• **${m.user.tag}**`).slice(0, 10).join("\n") + (members.size > 10 ? `\n*…and ${members.size - 10} more*` : "")
+      : "*No members*";
+    fields.push({
+      name: `@${role.name} (${members.size} member${members.size !== 1 ? "s" : ""})`,
+      value: `**Perms:** ${perms}\n${memberList}`,
+      inline: false,
+    });
+  }
+  const embed = new EmbedBuilder()
+    .setColor(Colors.Gold)
+    .setTitle(`👥 Who has "${query}"?`)
+    .addFields(fields.slice(0, 5))
+    .setFooter({ text: "Live data from Discord" })
+    .setTimestamp();
+  await message.reply({ embeds: [embed] });
+}
+
+async function cmdHistory(message: Message, args: string[]) {
+  if (!message.guild) {
+    await message.reply({ embeds: [errorEmbed("This command must be used in a server.")] });
+    return;
+  }
+  const rawDays = parseInt(args[0] ?? "7", 10);
+  const days = isNaN(rawDays) || rawDays < 1 ? 7 : Math.min(rawDays, 90);
+  const since = new Date(Date.now() - days * 24 * 60 * 60 * 1000);
+  const all = await db.select().from(roleAssignmentsTable)
+    .where(eq(roleAssignmentsTable.guildId, message.guild.id))
+    .orderBy(desc(roleAssignmentsTable.assignedAt));
+  const records = all.filter((r) => new Date(r.assignedAt) >= since);
+  if (!records.length) {
+    await message.reply({ embeds: [new EmbedBuilder().setColor(Colors.Yellow).setTitle(`No activity in the last ${days} day(s)`).setDescription("No role events recorded in this time period.")] });
+    return;
+  }
+  const given = records.filter((r) => r.action === "assigned").length;
+  const removed = records.filter((r) => r.action === "removed").length;
+  const lines = records.slice(0, 20).map((r) => {
+    const icon = r.action === "assigned" ? "🟢" : "🔴";
+    const verb = r.action === "assigned" ? "gave" : "removed";
+    return `${icon} ${ts(new Date(r.assignedAt))} **${r.executorTag}** ${verb} **${r.roleName}** → **${r.targetTag}**`;
+  });
+  if (records.length > 20) lines.push(`*…and ${records.length - 20} more*`);
+  const embed = new EmbedBuilder()
+    .setColor(0x5865f2)
+    .setTitle(`📅 Last ${days} day(s) — ${records.length} event(s)`)
+    .setDescription(lines.join("\n"))
+    .setFooter({ text: `🟢 ${given} given  •  🔴 ${removed} removed` })
+    .setTimestamp();
+  await message.reply({ embeds: [embed] });
+}
+
+async function cmdActive(message: Message, args: string[]) {
+  if (!message.guild) {
+    await message.reply({ embeds: [errorEmbed("This command must be used in a server.")] });
+    return;
+  }
+  const rawDays = parseInt(args[0] ?? "7", 10);
+  const days = isNaN(rawDays) || rawDays < 1 ? 7 : Math.min(rawDays, 90);
+  const since = new Date(Date.now() - days * 24 * 60 * 60 * 1000);
+  const all = await db.select().from(roleAssignmentsTable)
+    .where(eq(roleAssignmentsTable.guildId, message.guild.id))
+    .orderBy(desc(roleAssignmentsTable.assignedAt));
+  const recent = all.filter((r) => new Date(r.assignedAt) >= since);
+  if (!recent.length) {
+    await message.reply({ embeds: [new EmbedBuilder().setColor(Colors.Yellow).setTitle(`No activity in the last ${days} day(s)`).setDescription("No role events in this time window.")] });
+    return;
+  }
+  const modMap = new Map<string, { tag: string; given: number; removed: number }>();
+  for (const r of recent) {
+    if (!modMap.has(r.executorId)) modMap.set(r.executorId, { tag: r.executorTag, given: 0, removed: 0 });
+    const entry = modMap.get(r.executorId)!;
+    if (r.action === "assigned") entry.given++;
+    else entry.removed++;
+  }
+  const sorted = [...modMap.values()].sort((a, b) => (b.given + b.removed) - (a.given + a.removed));
+  const lines = sorted.slice(0, 10).map((m, i) => `${i + 1}. **${m.tag}** — 🟢 ${m.given} given, 🔴 ${m.removed} removed`);
+  const embed = new EmbedBuilder()
+    .setColor(Colors.Orange)
+    .setTitle(`⚡ Most Active Mods — Last ${days} day(s)`)
+    .setDescription(lines.join("\n"))
+    .setFooter({ text: `${recent.length} total events across ${modMap.size} moderator(s)` })
+    .setTimestamp();
+  await message.reply({ embeds: [embed] });
+}
+
+async function cmdTop(message: Message, args: string[]) {
+  if (!message.guild) {
+    await message.reply({ embeds: [errorEmbed("This command must be used in a server.")] });
+    return;
+  }
+  const rawN = parseInt(args[0] ?? "10", 10);
+  const n = isNaN(rawN) || rawN < 1 ? 10 : Math.min(rawN, 25);
+  const all = await db.select().from(roleAssignmentsTable)
+    .where(eq(roleAssignmentsTable.guildId, message.guild.id));
+  if (!all.length) {
+    await message.reply({ embeds: [new EmbedBuilder().setColor(Colors.Yellow).setTitle("No data yet").setDescription("No role events have been recorded.")] });
+    return;
+  }
+  const modMap = new Map<string, { tag: string; given: number; removed: number }>();
+  for (const r of all) {
+    if (!modMap.has(r.executorId)) modMap.set(r.executorId, { tag: r.executorTag, given: 0, removed: 0 });
+    const entry = modMap.get(r.executorId)!;
+    if (r.action === "assigned") entry.given++;
+    else entry.removed++;
+  }
+  const sorted = [...modMap.values()].sort((a, b) => (b.given + b.removed) - (a.given + a.removed));
+  const medals = ["🥇", "🥈", "🥉"];
+  const lines = sorted.slice(0, n).map((m, i) => `${medals[i] ?? `${i + 1}.`} **${m.tag}** — ${m.given + m.removed} total (🟢 ${m.given} given, 🔴 ${m.removed} removed)`);
+  const embed = new EmbedBuilder()
+    .setColor(Colors.Gold)
+    .setTitle(`🏆 Top ${Math.min(n, sorted.length)} Moderators`)
+    .setDescription(lines.join("\n"))
+    .setFooter({ text: `All-time • ${modMap.size} unique moderator(s) tracked` })
+    .setTimestamp();
+  await message.reply({ embeds: [embed] });
+}
+
+async function cmdAudit(message: Message) {
+  if (!message.guild) {
+    await message.reply({ embeds: [errorEmbed("This command must be used in a server.")] });
+    return;
+  }
+  const all = await db.select().from(roleAssignmentsTable)
+    .where(and(eq(roleAssignmentsTable.guildId, message.guild.id), eq(roleAssignmentsTable.action, "assigned")))
+    .orderBy(desc(roleAssignmentsTable.assignedAt));
+
+  const WINDOW_MS = 10 * 60 * 1000;
+  const THRESHOLD = 5;
+
+  const flagged: string[] = [];
+  const modGroups = new Map<string, typeof all>();
+  for (const r of all) {
+    if (!modGroups.has(r.executorId)) modGroups.set(r.executorId, []);
+    modGroups.get(r.executorId)!.push(r);
+  }
+  for (const [, events] of modGroups) {
+    for (let i = 0; i < events.length; i++) {
+      const windowEnd = new Date(events[i].assignedAt).getTime();
+      const windowStart = windowEnd - WINDOW_MS;
+      const inWindow = events.filter((e) => {
+        const t = new Date(e.assignedAt).getTime();
+        return t >= windowStart && t <= windowEnd;
+      });
+      if (inWindow.length >= THRESHOLD) {
+        const execTag = inWindow[0].executorTag;
+        const targets = [...new Set(inWindow.map((e) => e.targetTag))];
+        const entry = `⚠️ **${execTag}** assigned **${inWindow.length}** roles in 10 minutes (to: ${targets.slice(0, 3).map((t) => `**${t}**`).join(", ")}${targets.length > 3 ? ` and ${targets.length - 3} more` : ""}) — ${ts(new Date(inWindow[0].assignedAt))}`;
+        if (!flagged.includes(entry)) flagged.push(entry);
+        break;
+      }
+    }
+  }
+
+  if (!flagged.length) {
+    await message.reply({ embeds: [new EmbedBuilder().setColor(Colors.Green).setTitle("✅ Audit Clean").setDescription("No suspicious rapid role activity detected.\n\n*Threshold: 5+ roles assigned within 10 minutes by one mod.*")] });
+    return;
+  }
+  const embed = new EmbedBuilder()
+    .setColor(Colors.Red)
+    .setTitle(`🚨 Suspicious Activity — ${flagged.length} flag(s)`)
+    .setDescription(flagged.slice(0, 10).join("\n\n"))
+    .setFooter({ text: "Threshold: 5+ assignments in 10 min by one moderator" })
+    .setTimestamp();
+  await message.reply({ embeds: [embed] });
+}
+
+async function cmdUndone(message: Message, args: string[]) {
+  if (!message.guild) {
+    await message.reply({ embeds: [errorEmbed("This command must be used in a server.")] });
+    return;
+  }
+  const rawHours = parseInt(args[0] ?? "24", 10);
+  const hours = isNaN(rawHours) || rawHours < 1 ? 24 : Math.min(rawHours, 720);
+  const windowMs = hours * 60 * 60 * 1000;
+
+  const all = await db.select().from(roleAssignmentsTable)
+    .where(eq(roleAssignmentsTable.guildId, message.guild.id))
+    .orderBy(roleAssignmentsTable.assignedAt);
+
+  const bounced: string[] = [];
+  const assignments = all.filter((r) => r.action === "assigned");
+  for (const assign of assignments) {
+    const reversal = all.find((r) =>
+      r.action === "removed" &&
+      r.targetId === assign.targetId &&
+      r.roleId === assign.roleId &&
+      new Date(r.assignedAt).getTime() > new Date(assign.assignedAt).getTime() &&
+      new Date(r.assignedAt).getTime() - new Date(assign.assignedAt).getTime() <= windowMs
+    );
+    if (reversal) {
+      const gapMs = new Date(reversal.assignedAt).getTime() - new Date(assign.assignedAt).getTime();
+      const gapMins = Math.round(gapMs / 60000);
+      bounced.push(`• **${assign.roleName}** → **${assign.targetTag}** — given by **${assign.executorTag}** ${ts(new Date(assign.assignedAt))}, removed by **${reversal.executorTag}** ${ts(new Date(reversal.assignedAt))} *(${gapMins} min later)*`);
+    }
+  }
+
+  if (!bounced.length) {
+    await message.reply({ embeds: [new EmbedBuilder().setColor(Colors.Green).setTitle(`✅ No Role Bouncing`).setDescription(`No roles were given then removed within **${hours}h**.`)] });
+    return;
+  }
+  const embed = new EmbedBuilder()
+    .setColor(Colors.Yellow)
+    .setTitle(`🔄 Role Bouncing — ${bounced.length} case(s)`)
+    .setDescription(bounced.slice(0, 15).join("\n"))
+    .setFooter({ text: `Roles given then removed within ${hours}h` })
+    .setTimestamp();
+  await message.reply({ embeds: [embed] });
+}
+
+async function cmdExport(message: Message) {
+  if (!message.guild) {
+    await message.reply({ embeds: [errorEmbed("This command must be used in a server.")] });
+    return;
+  }
+  const records = await db.select().from(roleAssignmentsTable)
+    .where(eq(roleAssignmentsTable.guildId, message.guild.id))
+    .orderBy(desc(roleAssignmentsTable.assignedAt));
+  if (!records.length) {
+    await message.reply({ embeds: [new EmbedBuilder().setColor(Colors.Yellow).setTitle("Nothing to export").setDescription("No role events have been recorded yet.")] });
+    return;
+  }
+  const header = `Role Audit Export — ${message.guild.name}\nGenerated: ${new Date().toUTCString()}\nTotal events: ${records.length}\n${"─".repeat(60)}\n\n`;
+  const lines = records.map((r) => {
+    const date = new Date(r.assignedAt).toUTCString();
+    const verb = r.action === "assigned" ? "GAVE    " : "REMOVED ";
+    return `[${date}] ${r.executorTag.padEnd(32)} ${verb} @${r.roleName.padEnd(30)} → ${r.targetTag}`;
+  });
+  const content = header + lines.join("\n");
+  const buffer = Buffer.from(content, "utf-8");
+  const filename = `role-audit-${message.guild.id}-${Date.now()}.txt`;
+  await message.reply({
+    content: `📄 Full export — **${records.length}** event(s)`,
+    files: [{ attachment: buffer, name: filename }],
+  });
+}
+
 // ── Role change tracking ───────────────────────────────────────────────────────
 
 async function recordRoleEvent(
@@ -688,12 +1274,30 @@ export async function startBot() {
         await cmdPing(message);
       } else if (lower === "help") {
         await cmdHelp(message);
+
+      // ── Lookup commands ─────────────────────────────────────────────────────
       } else if (lower.startsWith("roles given ")) {
         const args = raw.slice("roles given ".length).trim().split(/\s+/);
         await cmdRolesGiven(message, args);
       } else if (lower.startsWith("roles removed ")) {
         const args = raw.slice("roles removed ".length).trim().split(/\s+/);
         await cmdRolesRemoved(message, args);
+      } else if (lower.startsWith("lookup ")) {
+        const args = raw.slice("lookup ".length).trim().split(/\s+/);
+        await cmdLookup(message, args);
+      } else if (lower.startsWith("timeline ")) {
+        const args = raw.slice("timeline ".length).trim().split(/\s+/);
+        await cmdTimeline(message, args);
+      } else if (lower.startsWith("mod ")) {
+        const args = raw.slice("mod ".length).trim().split(/\s+/);
+        await cmdMod(message, args);
+      } else if (lower.startsWith("between ")) {
+        const args = raw.slice("between ".length).trim().split(/\s+/);
+        await cmdBetween(message, args);
+      } else if (lower === "myactivity") {
+        await cmdMyActivity(message);
+
+      // ── Server log commands ─────────────────────────────────────────────────
       } else if (lower === "all roles given") {
         await cmdAllRolesGiven(message);
       } else if (lower === "all roles removed") {
@@ -701,8 +1305,37 @@ export async function startBot() {
       } else if (lower.startsWith("recent")) {
         const args = raw.slice("recent".length).trim().split(/\s+/);
         await cmdRecent(message, args);
+      } else if (lower.startsWith("history")) {
+        const args = raw.slice("history".length).trim().split(/\s+/);
+        await cmdHistory(message, args);
+      } else if (lower.startsWith("active")) {
+        const args = raw.slice("active".length).trim().split(/\s+/);
+        await cmdActive(message, args);
+
+      // ── Search & filter commands ────────────────────────────────────────────
+      } else if (lower.startsWith("search ")) {
+        const args = raw.slice("search ".length).trim().split(/\s+/);
+        await cmdSearch(message, args);
+      } else if (lower.startsWith("find ")) {
+        const args = raw.slice("find ".length).trim().split(/\s+/);
+        await cmdFind(message, args);
+      } else if (lower.startsWith("whohas ")) {
+        const args = raw.slice("whohas ".length).trim().split(/\s+/);
+        await cmdWhoHas(message, args);
+      } else if (lower.startsWith("undone")) {
+        const args = raw.slice("undone".length).trim().split(/\s+/);
+        await cmdUndone(message, args);
+      } else if (lower === "audit") {
+        await cmdAudit(message);
+
+      // ── Stats & export commands ─────────────────────────────────────────────
       } else if (lower === "server stats") {
         await cmdServerStats(message);
+      } else if (lower.startsWith("top")) {
+        const args = raw.slice("top".length).trim().split(/\s+/);
+        await cmdTop(message, args);
+      } else if (lower === "export") {
+        await cmdExport(message);
       }
       // Unknown commands are silently ignored to avoid noise
     } catch (err: any) {
