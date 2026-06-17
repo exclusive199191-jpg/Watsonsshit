@@ -77,24 +77,22 @@ function errorEmbed(msg: string): EmbedBuilder {
 
 /**
  * Convert a raw drizzle/pg error into a short, user-safe string.
- * Drizzle wraps errors as "Failed query: <SQL>\nparams: <…>\n<actual PG message>".
- * We strip the SQL noise and surface only the meaningful PG line.
+ * DrizzleQueryError sets message = "Failed query: <sql>\nparams: <params>"
+ * and stores the real PG error in err.cause. We surface err.cause.message
+ * and fall back to the first line of err.message if cause is absent.
  */
 function friendlyError(err: any): string {
+  // Drizzle puts the original pg error in err.cause
+  const causeMsg: string | undefined = err?.cause?.message;
+  if (causeMsg) return causeMsg.split("\n")[0];
+
   const raw: string = err?.message ?? String(err);
 
+  // Strip the "Failed query: …\nparams: …" wrapper if cause was missing
   if (raw.startsWith("Failed query:")) {
-    const lines = raw.split("\n").map((l: string) => l.trim()).filter(Boolean);
-    // Everything after the "params:" line is the actual PG error message
-    const paramsIdx = lines.findIndex((l: string) => l.startsWith("params:"));
-    if (paramsIdx !== -1 && paramsIdx + 1 < lines.length) {
-      return lines.slice(paramsIdx + 1).join(" ");
-    }
-    // No params line found — take the last non-empty line (most likely the PG error)
-    return lines[lines.length - 1] ?? "An unexpected database error occurred.";
+    return "An unexpected database error occurred. Please try again.";
   }
 
-  // Fallback: return first line only (avoids multi-line SQL dumps)
   return raw.split("\n")[0] ?? "An unexpected error occurred.";
 }
 
