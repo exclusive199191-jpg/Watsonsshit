@@ -3,13 +3,14 @@ import {
   GatewayIntentBits,
   Events,
   AuditLogEvent,
+  ActivityType,
   PermissionsBitField,
   EmbedBuilder,
   Colors,
   type Message,
   type GuildMember,
 } from "discord.js";
-import { db, pool } from "@workspace/db";
+import { db } from "@workspace/db";
 import { roleAssignmentsTable } from "@workspace/db";
 import { eq, and, desc, sql } from "drizzle-orm";
 import { logger } from "./lib/logger";
@@ -491,7 +492,7 @@ async function cmdRecent(message: Message, args: string[]) {
   }
 
   const rawN = parseInt(args[0] ?? "10", 10);
-  const n = isNaN(rawN) || rawN < 1 ? 10 : Math.min(rawN, 25);
+  const n = isNaN(rawN) || rawN < 1 ? 10 : Math.min(rawN, 50);
 
   const records = await db
     .select()
@@ -1052,12 +1053,14 @@ async function cmdAudit(message: Message) {
   const THRESHOLD = 5;
 
   const flagged: string[] = [];
+  const seenExecutors = new Set<string>();
   const modGroups = new Map<string, typeof all>();
   for (const r of all) {
     if (!modGroups.has(r.executorId)) modGroups.set(r.executorId, []);
     modGroups.get(r.executorId)!.push(r);
   }
-  for (const [, events] of modGroups) {
+  for (const [executorId, events] of modGroups) {
+    if (seenExecutors.has(executorId)) continue;
     for (let i = 0; i < events.length; i++) {
       const windowEnd = new Date(events[i].assignedAt).getTime();
       const windowStart = windowEnd - WINDOW_MS;
@@ -1066,10 +1069,10 @@ async function cmdAudit(message: Message) {
         return t >= windowStart && t <= windowEnd;
       });
       if (inWindow.length >= THRESHOLD) {
+        seenExecutors.add(executorId);
         const execTag = inWindow[0].executorTag;
         const targets = [...new Set(inWindow.map((e) => e.targetTag))];
-        const entry = `⚠️ **${execTag}** assigned **${inWindow.length}** roles in 10 minutes (to: ${targets.slice(0, 3).map((t) => `**${t}**`).join(", ")}${targets.length > 3 ? ` and ${targets.length - 3} more` : ""}) — ${ts(new Date(inWindow[0].assignedAt))}`;
-        if (!flagged.includes(entry)) flagged.push(entry);
+        flagged.push(`⚠️ **${execTag}** assigned **${inWindow.length}** roles in 10 minutes (to: ${targets.slice(0, 3).map((t) => `**${t}**`).join(", ")}${targets.length > 3 ? ` and ${targets.length - 3} more` : ""}) — ${ts(new Date(inWindow[inWindow.length - 1].assignedAt))}`);
         break;
       }
     }
@@ -1102,16 +1105,19 @@ async function cmdUndone(message: Message, args: string[]) {
     .orderBy(roleAssignmentsTable.assignedAt);
 
   const bounced: string[] = [];
+  const usedReversalIds = new Set<number>();
   const assignments = all.filter((r) => r.action === "assigned");
   for (const assign of assignments) {
     const reversal = all.find((r) =>
       r.action === "removed" &&
+      !usedReversalIds.has(r.id) &&
       r.targetId === assign.targetId &&
       r.roleId === assign.roleId &&
       new Date(r.assignedAt).getTime() > new Date(assign.assignedAt).getTime() &&
       new Date(r.assignedAt).getTime() - new Date(assign.assignedAt).getTime() <= windowMs
     );
     if (reversal) {
+      usedReversalIds.add(reversal.id);
       const gapMs = new Date(reversal.assignedAt).getTime() - new Date(assign.assignedAt).getTime();
       const gapMins = Math.round(gapMs / 60000);
       bounced.push(`• **${assign.roleName}** → **${assign.targetTag}** — given by **${assign.executorTag}** ${ts(new Date(assign.assignedAt))}, removed by **${reversal.executorTag}** ${ts(new Date(reversal.assignedAt))} *(${gapMins} min later)*`);
@@ -1203,8 +1209,10 @@ export async function startBot() {
     ],
   });
 
-  client.once(Events.ClientReady, () => {
-    logger.info({ tag: client.user?.tag }, "Discord bot logged in and ready");
+  client.once(Events.ClientReady, (readyClient) => {
+    logger.info({ tag: readyClient.user.tag }, "Discord bot logged in and ready");
+    readyClient.user.setActivity("/florida", { type: ActivityType.Watching });
+    logger.info("Rich presence set: Watching /florida");
   });
 
   // ── Track role assignments and removals ──────────────────────────────────────
