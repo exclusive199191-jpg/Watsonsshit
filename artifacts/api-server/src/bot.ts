@@ -76,24 +76,24 @@ function errorEmbed(msg: string): EmbedBuilder {
 }
 
 /**
- * Convert a raw drizzle/pg error into a short, user-safe string.
- * DrizzleQueryError sets message = "Failed query: <sql>\nparams: <params>"
- * and stores the real PG error in err.cause. We surface err.cause.message
- * and fall back to the first line of err.message if cause is absent.
+ * Walk an error chain and return the most meaningful single-line message.
+ * DrizzleQueryError stores the real PG error in err.cause; plain pg
+ * DatabaseErrors surface their message directly.  We try every layer.
  */
 function friendlyError(err: any): string {
-  // Drizzle puts the original pg error in err.cause
-  const causeMsg: string | undefined = err?.cause?.message;
-  if (causeMsg) return causeMsg.split("\n")[0];
-
-  const raw: string = err?.message ?? String(err);
-
-  // Strip the "Failed query: …\nparams: …" wrapper if cause was missing
-  if (raw.startsWith("Failed query:")) {
-    return "An unexpected database error occurred. Please try again.";
+  // Walk up to three levels of cause to find a concrete message
+  for (const e of [err, err?.cause, err?.cause?.cause]) {
+    if (!e) continue;
+    const msg: string = e?.message ?? String(e);
+    if (!msg) continue;
+    // Skip drizzle wrapper lines — they carry no user-actionable info
+    if (msg.startsWith("Failed query:")) continue;
+    if (msg.startsWith("params:")) continue;
+    // Skip empty / generic Node errors
+    if (msg === "[object Object]") continue;
+    return msg.split("\n")[0];
   }
-
-  return raw.split("\n")[0] ?? "An unexpected error occurred.";
+  return "A database error occurred. Please try again.";
 }
 
 function noDataEmbed(action: "given" | "removed", filter?: string): EmbedBuilder {
@@ -1403,7 +1403,12 @@ export async function startBot() {
       }
       // Unknown commands are silently ignored to avoid noise
     } catch (err: any) {
-      logger.error({ err: err?.message ?? String(err), stack: err?.stack }, "Command error");
+      logger.error({
+        err: err?.message ?? String(err),
+        cause: err?.cause?.message ?? err?.cause,
+        code: err?.cause?.code ?? err?.code,
+        stack: err?.stack,
+      }, "Command error");
       const clean = friendlyError(err);
       await message
         .reply({
