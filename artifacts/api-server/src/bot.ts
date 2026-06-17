@@ -74,6 +74,29 @@ function errorEmbed(msg: string): EmbedBuilder {
     .setDescription(msg);
 }
 
+/**
+ * Convert a raw drizzle/pg error into a short, user-safe string.
+ * Drizzle wraps errors as "Failed query: <SQL>\nparams: <…>\n<actual PG message>".
+ * We strip the SQL noise and surface only the meaningful line.
+ */
+function friendlyError(err: any): string {
+  const raw: string = err?.message ?? String(err);
+
+  // drizzle-orm error: pull out everything after the last blank line (the PG message)
+  if (raw.startsWith("Failed query:")) {
+    // Lines after the params line contain the actual PG error
+    const lines = raw.split("\n").map((l: string) => l.trim()).filter(Boolean);
+    // Skip lines that are the SQL or the params line
+    const pgLine = lines.find(
+      (l: string) => !l.startsWith("Failed query:") && !l.startsWith("params:") && !l.startsWith("select") && !l.startsWith("insert") && !l.startsWith("update") && !l.startsWith("delete")
+    );
+    if (pgLine) return pgLine;
+  }
+
+  // Fallback: return first line only (avoids multi-line SQL dumps)
+  return raw.split("\n")[0] ?? "An unexpected error occurred.";
+}
+
 function noDataEmbed(action: "given" | "removed", filter?: string): EmbedBuilder {
   return new EmbedBuilder()
     .setColor(Colors.Yellow)
@@ -684,14 +707,11 @@ export async function startBot() {
       // Unknown commands are silently ignored to avoid noise
     } catch (err: any) {
       logger.error({ err: err?.message ?? String(err), stack: err?.stack }, "Command error");
+      const clean = friendlyError(err);
       await message
         .reply({
           embeds: [
-            errorEmbed(
-              err?.message
-                ? `\`${err.message}\`\n\nIf this keeps happening, check the bot has **Send Messages** and **Read Message History** permissions in this channel.`
-                : "Something went wrong. Check the bot has correct channel permissions."
-            ),
+            errorEmbed(`${clean}\n\nIf this keeps happening, contact a server admin.`),
           ],
         })
         .catch((e: any) => logger.error({ e: e?.message }, "Failed to send error reply — missing Send Messages permission?"));
