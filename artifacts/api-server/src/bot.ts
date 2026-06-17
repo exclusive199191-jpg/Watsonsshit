@@ -125,71 +125,71 @@ async function cmdPing(message: Message) {
 }
 
 async function cmdHelp(message: Message) {
+  const line = "─────────────────────────────────────";
+
   const embed = new EmbedBuilder()
-    .setColor(0x5865f2)
-    .setTitle("Role Audit Bot — Help")
-    .setDescription("Tracks every elevated role assignment and removal. Prefix: `,` (comma)")
+    .setColor(0x2B2D31)
+    .setTitle("Role Audit  ·  Command Reference")
+    .setDescription(
+      "Tracks every elevated role assignment and removal.\n" +
+      `All commands use the \`,\` prefix  ·  e.g. \`,recent 15\``
+    )
     .addFields(
       {
-        name: "🔎 Lookup Commands",
+        name: "MEMBER LOOKUP",
         value: [
-          "`,roles given <@user>` — Roles a mod **gave** to others",
-          "`,roles removed <@user>` — Roles a mod **removed** from others",
-          "`,lookup <@user>` — Who gave/removed elevated roles **to** a user",
-          "`,timeline <@user>` — Chronological role history for a user",
-          "`,mod <@user>` — Full moderator profile & stats",
-          "`,between <@user1> <@user2>` — All role interactions between two users",
-          "`,myactivity` — Your own role moderation stats",
+          "`,roles given <user>`  —  Roles a moderator has given to others",
+          "`,roles removed <user>`  —  Roles a moderator has stripped from others",
+          "`,lookup <user>`  —  Who gave or removed roles **to** a specific member",
+          "`,timeline <user>`  —  Full chronological role history for a member",
+          "`,mod <user>`  —  Detailed moderator profile with stats and recent events",
+          "`,between <user1> <user2>`  —  All role interactions between two users",
+          "`,myactivity`  —  Your own give/remove counts and recent events",
         ].join("\n"),
       },
+      { name: line, value: " " },
       {
-        name: "📋 Server Log Commands",
+        name: "SERVER LOGS",
         value: [
-          "`,all roles given` — Latest 25 role assignments",
-          "`,all roles removed` — Latest 25 role removals",
-          "`,recent [n]` — Last N events, given + removed (default 10, max 50)",
-          "`,history [days]` — Activity in the last N days (default 7)",
-          "`,active [days]` — Most active mods in the last N days (default 7)",
+          "`,all roles given`  —  Most recent 25 role assignments",
+          "`,all roles removed`  —  Most recent 25 role removals",
+          "`,recent [n]`  —  Last N events across both actions  *(default 10, max 50)*",
+          "`,history [days]`  —  All activity within the last N days  *(default 7)*",
+          "`,active [days]`  —  Most active moderators in the last N days  *(default 7)*",
         ].join("\n"),
       },
+      { name: line, value: " " },
       {
-        name: "🔍 Search & Filter",
+        name: "SEARCH  &  FILTER",
         value: [
-          "`,search <rolename>` — All events for a specific role",
-          "`,find <name>` — Search across all usernames/tags",
-          "`,whohas <rolename>` — Who currently holds a role with elevated perms",
-          "`,undone [hours]` — Roles given then removed within N hours (default 24)",
-          "`,audit` — Detect suspicious rapid role activity",
+          "`,search <role>`  —  Every event involving a specific role name",
+          "`,find <name>`  —  Search all records by any username or tag fragment",
+          "`,whohas <role>`  —  Who currently holds a role with elevated permissions",
+          "`,undone [hours]`  —  Roles given then removed within N hours  *(default 24)*",
+          "`,audit`  —  Flag moderators who assigned 5+ roles within any 10-minute window",
         ].join("\n"),
       },
+      { name: line, value: " " },
       {
-        name: "📊 Stats & Export",
+        name: "STATS  &  EXPORT",
         value: [
-          "`,server stats` — Server-wide role moderation summary",
-          "`,top [n]` — Top N most active moderators (default 10)",
-          "`,export` — Download the full role log as a text file",
+          "`,server stats`  —  Server-wide summary with top moderators and top roles",
+          "`,top [n]`  —  All-time moderator leaderboard  *(default 10)*",
+          "`,export`  —  Download the complete role log as a plain-text file",
         ].join("\n"),
       },
+      { name: line, value: " " },
       {
-        name: "⚙️ Utility",
-        value: [
-          "`,ping` — Check if bot is online",
-          "`,help` — Show this menu",
-        ].join("\n"),
-      },
-      {
-        name: "🔐 What counts as elevated?",
+        name: "TRACKED PERMISSIONS",
         value:
-          "`Administrator` • `Ban Members` • `Kick Members` • `Timeout Members`\n" +
-          "`Manage Roles` • `Manage Guild` • `Manage Channels` • `Manage Messages`\n" +
-          "`Manage Nicknames` • `Manage Webhooks` • `Manage Threads`",
-      },
-      {
-        name: "⚠️ Note",
-        value: "Only events after the bot joined are tracked. Historical data is not available.",
+          "`Administrator`  `Ban Members`  `Kick Members`  `Timeout Members`\n" +
+          "`Manage Roles`  `Manage Guild`  `Manage Channels`  `Manage Messages`\n" +
+          "`Manage Nicknames`  `Manage Webhooks`  `Manage Threads`",
       },
     )
+    .setFooter({ text: "Only events recorded after the bot joined are available.  Historical data cannot be retrieved." })
     .setTimestamp();
+
   await message.reply({ embeds: [embed] });
 }
 
