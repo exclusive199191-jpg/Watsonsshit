@@ -10,6 +10,8 @@ servers:
 tags:
   - name: health
     description: Health operations
+  - name: roles
+    description: Role assignment operations
 paths:
   /healthz:
     get:
@@ -24,6 +26,75 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/HealthStatus"
+
+  /roles:
+    get:
+      operationId: listRoleEvents
+      tags: [roles]
+      summary: List role assignment events
+      parameters:
+        - name: page
+          in: query
+          schema:
+            type: integer
+            default: 1
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            default: 50
+        - name: guildId
+          in: query
+          schema:
+            type: string
+        - name: action
+          in: query
+          schema:
+            type: string
+            enum: [assigned, removed]
+        - name: search
+          in: query
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Paginated list of role events
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/RoleEventPage"
+
+  /roles/stats:
+    get:
+      operationId: getRoleStats
+      tags: [roles]
+      summary: Role assignment summary stats
+      parameters:
+        - name: guildId
+          in: query
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Stats summary
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/RoleStats"
+
+  /roles/guilds:
+    get:
+      operationId: listGuilds
+      tags: [roles]
+      summary: List guilds that have role events
+      responses:
+        "200":
+          description: Guild list
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/GuildList"
+
 components:
   schemas:
     HealthStatus:
@@ -34,3 +105,133 @@ components:
       required:
         - status
 
+    RoleEvent:
+      type: object
+      properties:
+        id:
+          type: integer
+        guildId:
+          type: string
+        executorId:
+          type: string
+        executorTag:
+          type: string
+        targetId:
+          type: string
+        targetTag:
+          type: string
+        roleId:
+          type: string
+        roleName:
+          type: string
+        action:
+          type: string
+          enum: [assigned, removed]
+        assignedAt:
+          type: string
+          format: date-time
+      required:
+        - id
+        - guildId
+        - executorId
+        - executorTag
+        - targetId
+        - targetTag
+        - roleId
+        - roleName
+        - action
+        - assignedAt
+
+    RoleEventPage:
+      type: object
+      properties:
+        data:
+          type: array
+          items:
+            $ref: "#/components/schemas/RoleEvent"
+        total:
+          type: integer
+        page:
+          type: integer
+        limit:
+          type: integer
+      required:
+        - data
+        - total
+        - page
+        - limit
+
+    TopMod:
+      type: object
+      properties:
+        executorId:
+          type: string
+        executorTag:
+          type: string
+        assigned:
+          type: integer
+        removed:
+          type: integer
+        total:
+          type: integer
+      required:
+        - executorId
+        - executorTag
+        - assigned
+        - removed
+        - total
+
+    TopRole:
+      type: object
+      properties:
+        roleName:
+          type: string
+        times:
+          type: integer
+      required:
+        - roleName
+        - times
+
+    RoleStats:
+      type: object
+      properties:
+        totalAssigned:
+          type: integer
+        totalRemoved:
+          type: integer
+        totalEvents:
+          type: integer
+        topMods:
+          type: array
+          items:
+            $ref: "#/components/schemas/TopMod"
+        topRoles:
+          type: array
+          items:
+            $ref: "#/components/schemas/TopRole"
+      required:
+        - totalAssigned
+        - totalRemoved
+        - totalEvents
+        - topMods
+        - topRoles
+
+    Guild:
+      type: object
+      properties:
+        id:
+          type: string
+        name:
+          type: string
+      required:
+        - id
+
+    GuildList:
+      type: object
+      properties:
+        guilds:
+          type: array
+          items:
+            $ref: "#/components/schemas/Guild"
+      required:
+        - guilds

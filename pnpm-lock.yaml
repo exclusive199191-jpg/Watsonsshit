@@ -217,6 +217,13 @@ importers:
         version: 3.1.0
 
   artifacts/mockup-sandbox:
+    dependencies:
+      '@tanstack/react-query':
+        specifier: 'catalog:'
+        version: 5.100.9(react@19.1.0)
+      '@workspace/api-client-react':
+        specifier: workspace:*
+        version: link:../../lib/api-client-react
     devDependencies:
       '@hookform/resolvers':
         specifier: ^3.10.0

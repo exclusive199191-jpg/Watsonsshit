@@ -6,6 +6,10 @@
  * OpenAPI spec version: 0.1.0
  */
 
-export interface HealthStatus {
-  status: string;
+export interface TopMod {
+  executorId: string;
+  executorTag: string;
+  assigned: number;
+  removed: number;
+  total: number;
 }
