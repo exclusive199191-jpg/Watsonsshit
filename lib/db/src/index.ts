@@ -13,20 +13,30 @@ if (!url) {
   );
 }
 
+// Determine SSL config from the URL:
+// - railway.internal hosts are on a private VPC — no SSL needed
+// - sslmode=disable in the URL → no SSL
+// - Everything else (external Railway proxy, Supabase, etc.) → SSL with self-signed cert support
+function resolveSsl(connectionString: string): pg.PoolConfig["ssl"] {
+  try {
+    const u = new URL(connectionString);
+    const sslmode = u.searchParams.get("sslmode");
+    if (sslmode === "disable") return false;
+    if (u.hostname.endsWith(".railway.internal")) return false;
+    return { rejectUnauthorized: false };
+  } catch {
+    return { rejectUnauthorized: false };
+  }
+}
+
 export const pool = url
   ? new Pool({
       connectionString: url,
-      // Railway PostgreSQL (and most cloud providers) require SSL.
-      // rejectUnauthorized:false accepts self-signed certs (standard for Railway).
-      ssl: { rejectUnauthorized: false },
-      // Keep connections alive so Railway infra doesn't silently kill them
+      ssl: resolveSsl(url),
       keepAlive: true,
       keepAliveInitialDelayMillis: 10_000,
-      // Drop idle connections after 5s to avoid ETIMEDOUT on Railway
       idleTimeoutMillis: 5_000,
-      // Fail reasonably fast if the DB is unreachable
       connectionTimeoutMillis: 15_000,
-      // Small pool — Discord bot has very low concurrency
       max: 5,
     })
   : null;
@@ -35,6 +45,17 @@ export const pool = url
 pool?.on("error", (err: Error) => {
   console.error(`[db] Pool connection error: ${err.message}`);
 });
+
+// Export the DB hostname (no credentials) for diagnostic logging
+export function dbHostname(): string {
+  if (!url) return "(not configured)";
+  try {
+    const u = new URL(url);
+    return `${u.hostname}:${u.port || "5432"}`;
+  } catch {
+    return "(invalid URL)";
+  }
+}
 
 export const db = url ? drizzle(pool as pg.Pool, { schema }) : null;
 

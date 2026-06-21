@@ -1,4 +1,4 @@
-import { pool } from "@workspace/db";
+import { pool, dbHostname } from "@workspace/db";
 import { logger } from "./lib/logger";
 import { setDbTableReady } from "./db-state";
 
@@ -15,10 +15,13 @@ export async function runMigrations() {
     return;
   }
 
+  const host = dbHostname();
+  logger.info(`Starting migrations — target host: ${host}`);
+
   for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
     let client;
     try {
-      logger.info(`Migration attempt ${attempt}/${MAX_RETRIES} — connecting...`);
+      logger.info(`Migration attempt ${attempt}/${MAX_RETRIES} — connecting to ${host}...`);
       client = await pool.connect();
 
       await client.query(`
@@ -56,14 +59,14 @@ export async function runMigrations() {
           ON role_assignments (guild_id, target_id, assigned_at DESC)
       `);
 
-      logger.info("Database migrations complete — table is ready.");
+      logger.info(`Database migrations complete — table is ready. (host: ${host})`);
       setDbTableReady(true);
       return;
     } catch (err: any) {
       const code: string = err?.code ?? err?.cause?.code ?? "NO_CODE";
       const msg: string = err?.message ?? err?.cause?.message ?? String(err);
       logger.error(
-        `Migration attempt ${attempt}/${MAX_RETRIES} FAILED — [${code}] ${msg}`
+        `Migration attempt ${attempt}/${MAX_RETRIES} FAILED — host: ${host} | [${code}] ${msg || "(no message)"}`
       );
       if (attempt < MAX_RETRIES) {
         logger.info(`Retrying migration in ${RETRY_DELAY_MS / 1000}s...`);
@@ -71,8 +74,10 @@ export async function runMigrations() {
       } else {
         logger.error(
           `All ${MAX_RETRIES} migration attempts failed. ` +
-          `Last error: [${code}] ${msg}. ` +
-          "Database commands will error until the table exists. Run ,migrate in Discord to retry."
+          `Could not reach ${host}. ` +
+          `Last error: [${code}] ${msg || "(no message)"}. ` +
+          "Check that DATABASE_URL points to the correct host and that the Railway service has a reference to the PostgreSQL plugin. " +
+          "Run ,migrate in Discord to retry after fixing the URL."
         );
         throw err;
       }
