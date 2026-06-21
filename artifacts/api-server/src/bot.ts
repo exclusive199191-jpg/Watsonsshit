@@ -55,6 +55,33 @@ function getElevatedPermNames(permissions: PermissionsBitField): string[] {
     .map((perm) => ELEVATED_PERM_NAMES[String(perm)] ?? "Unknown");
 }
 
+// ── PostgreSQL error code map ──────────────────────────────────────────────────
+
+const PG_CODES: Record<string, string> = {
+  "42P01": 'Table "role_assignments" doesn\'t exist — migrations may not have run yet.',
+  "42703": "Column not found — schema may be out of date. Re-run migrations.",
+  "23505": "Duplicate entry — this record already exists.",
+  "23503": "Foreign key violation.",
+  "28P01": "Database authentication failed. Check the DATABASE_URL password.",
+  "28000": "Database authentication failed. Check DATABASE_URL credentials.",
+  "3D000": "Database does not exist. Check the DATABASE_URL database name.",
+  "08000": "Database connection failed.",
+  "08003": "Database connection lost. Will retry automatically.",
+  "08006": "Database connection failure. Will retry automatically.",
+  "08001": "Unable to connect to database. Check DATABASE_URL host/port.",
+  "08004": "Database rejected the connection.",
+  "57014": "Query cancelled (timeout). Try a more specific command.",
+  "53300": "Database has too many connections.",
+  "55P03": "Database table is locked. Try again in a moment.",
+  "XX000": "Internal database error.",
+};
+
+// ── DB readiness flag (set after successful migration) ─────────────────────────
+
+let dbTableReady = false;
+
+export function setDbTableReady(ready: boolean) { dbTableReady = ready; }
+
 // ── In-memory error log ────────────────────────────────────────────────────────
 
 interface ErrorLogEntry {
@@ -63,44 +90,73 @@ interface ErrorLogEntry {
   message: string;
   code?: string;
   detail?: string;
-  stack?: string;
 }
 
 const ERROR_LOG: ErrorLogEntry[] = [];
 const MAX_LOG_SIZE = 25;
 
+/**
+ * Dig through every layer of an error to find raw pg DatabaseError fields.
+ * Drizzle-orm 0.45 wraps pg errors — the DatabaseError (with `.code`, `.detail`)
+ * may be on `err.cause` or on `err` itself if Drizzle didn't wrap it.
+ */
+function digPgError(err: any): { message: string | null; code: string | null; detail: string | null } {
+  for (const e of [err, err?.cause, err?.cause?.cause]) {
+    if (!e) continue;
+    const code: string | null = typeof e?.code === "string" ? e.code : null;
+    const msg: string | null = typeof e?.message === "string" ? e.message : null;
+    const detail: string | null = typeof e?.detail === "string" ? e.detail : null;
+    // pg error codes are exactly 5 alphanumeric characters
+    if (code && /^[0-9A-Z]{5}$/i.test(code)) {
+      return { message: msg, code: code.toUpperCase(), detail };
+    }
+    // Non-Drizzle message — use it directly
+    if (msg && !msg.startsWith("Failed query:") && !msg.startsWith("params:") && msg !== "[object Object]") {
+      return { message: msg, code: null, detail };
+    }
+  }
+  return { message: null, code: null, detail: null };
+}
+
+/**
+ * User-facing message for Discord embeds.
+ * NEVER shows raw JSON, stack traces, or Drizzle internals.
+ */
+function friendlyError(err: any): string {
+  const { message, code } = digPgError(err);
+  if (code && PG_CODES[code]) return PG_CODES[code];
+  if (message) return message.split("\n")[0].slice(0, 300);
+  return "A database error occurred. Please try again.";
+}
+
+/**
+ * Full technical message for the error log (more detail than friendlyError).
+ */
+function extractFullMessage(err: any): string {
+  const { message, code, detail } = digPgError(err);
+  const parts: string[] = [];
+  if (code) parts.push(`[${code}]`);
+  if (message) parts.push(message.split("\n")[0]);
+  if (detail) parts.push(`↳ ${detail}`);
+  if (parts.length) return parts.join(" ");
+  // Fallback: show the query snippet from DrizzleQueryError
+  const query = (err as any)?.query;
+  if (query) return `Failed query: ${String(query).slice(0, 150)}`;
+  // Final fallback: first line of stack
+  const stack = err?.stack ?? err?.message ?? String(err);
+  return String(stack).split("\n")[0].slice(0, 200);
+}
+
 function pushErrorLog(command: string, err: any) {
-  const entry: ErrorLogEntry = {
+  const { code, detail } = digPgError(err);
+  ERROR_LOG.unshift({
     at: new Date(),
     command: command.slice(0, 60),
     message: extractFullMessage(err),
-    code: err?.cause?.code ?? err?.code,
-    detail: err?.cause?.detail ?? err?.detail,
-    stack: (err?.stack ?? "").split("\n").slice(0, 3).join(" | "),
-  };
-  ERROR_LOG.unshift(entry);
+    code: code ?? undefined,
+    detail: detail ?? undefined,
+  });
   if (ERROR_LOG.length > MAX_LOG_SIZE) ERROR_LOG.length = MAX_LOG_SIZE;
-}
-
-/** Extract the most useful single-line message from any error, including pg errors. */
-function extractFullMessage(err: any): string {
-  // Walk up to four levels: err → err.cause → err.cause.cause → err.cause.cause.cause
-  const chain = [err, err?.cause, err?.cause?.cause, err?.cause?.cause?.cause];
-  for (const e of chain) {
-    if (!e) continue;
-    const msg: string = e?.message ?? String(e);
-    if (!msg || msg === "[object Object]") continue;
-    if (msg.startsWith("params:")) continue;
-    // "Failed query:" lines are Drizzle wrappers — skip but keep looking
-    if (msg.startsWith("Failed query:")) continue;
-    return msg.split("\n")[0];
-  }
-  // Last resort: stringify the whole error
-  try {
-    const j = JSON.stringify(err, Object.getOwnPropertyNames(err ?? {}));
-    if (j && j !== "{}") return j.slice(0, 200);
-  } catch {}
-  return "Unknown error";
 }
 
 // ── Helpers ────────────────────────────────────────────────────────────────────
@@ -121,18 +177,6 @@ function errorEmbed(msg: string): EmbedBuilder {
     .setColor(Colors.Red)
     .setTitle("❌ Error")
     .setDescription(msg);
-}
-
-/**
- * Return a short, user-friendly error message for Discord embeds.
- * Uses extractFullMessage internally so it benefits from the same
- * deep chain-walking logic.
- */
-function friendlyError(err: any): string {
-  const msg = extractFullMessage(err);
-  if (msg === "Unknown error") return "A database error occurred. Please try again.";
-  // Truncate very long messages so they fit in an embed
-  return msg.length > 300 ? msg.slice(0, 297) + "…" : msg;
 }
 
 function noDataEmbed(action: "given" | "removed", filter?: string): EmbedBuilder {
@@ -165,15 +209,34 @@ async function cmdStatus(message: Message, dbAvailable: boolean) {
   const latency = Date.now() - message.createdTimestamp;
   const guild = message.guild;
 
-  const dbStatus = dbAvailable ? "✅  Connected" : "❌  Not configured — set DATABASE_URL";
+  let dbStatus: string;
+  let color: number;
+  if (!dbAvailable) {
+    dbStatus = "❌  Not configured — set `DATABASE_URL` in your environment";
+    color = Colors.Red;
+  } else if (!dbTableReady) {
+    dbStatus = "⚠️  Connected but table missing — migrations failed or still running";
+    color = Colors.Yellow;
+  } else {
+    dbStatus = "✅  Connected and ready";
+    color = Colors.Green;
+  }
+
+  const tableStatus = !dbAvailable
+    ? "❌  N/A (no database)"
+    : dbTableReady
+    ? "✅  `role_assignments` exists"
+    : "⚠️  `role_assignments` table not found — run `,migrate` or check Railway logs";
+
   const guildName = guild?.name ?? "Unknown";
   const guildMembers = guild?.memberCount ?? "?";
 
   const embed = new EmbedBuilder()
-    .setColor(dbAvailable ? Colors.Green : Colors.Red)
+    .setColor(color)
     .setTitle("Bot Status")
     .addFields(
       { name: "Database", value: dbStatus, inline: false },
+      { name: "Table", value: tableStatus, inline: false },
       { name: "Bot latency", value: `${latency}ms`, inline: true },
       { name: "WebSocket ping", value: `${message.client.ws.ping}ms`, inline: true },
       { name: "Server", value: guildName, inline: true },
@@ -181,9 +244,11 @@ async function cmdStatus(message: Message, dbAvailable: boolean) {
       { name: "Uptime", value: `${Math.floor((message.client.uptime ?? 0) / 60000)}m`, inline: true },
     )
     .setFooter({
-      text: dbAvailable
-        ? "All systems operational."
-        : "DATABASE_URL is not set in Railway. Add a PostgreSQL service and set DATABASE_URL.",
+      text: !dbAvailable
+        ? "Fix: add a PostgreSQL service in Railway and set DATABASE_URL."
+        : !dbTableReady
+        ? "Fix: check Railway logs for migration errors, or run ,migrate to retry."
+        : "All systems operational.",
     })
     .setTimestamp();
 
@@ -248,7 +313,8 @@ async function cmdHelp(message: Message) {
       {
         name: "UTILITIES",
         value: [
-          "`,status`  —  Show database connection, latency, and bot health",
+          "`,status`  —  Show database connection, table health, and bot latency",
+          "`,migrate`  —  Retry database migrations if the table is missing",
           "`,logs`  —  Show all recent command errors (last 25, in-memory)",
           "`,ping`  —  Bot latency",
           "`,help`  —  This command reference",
@@ -1279,6 +1345,51 @@ async function cmdLogs(message: Message) {
   }
 }
 
+async function cmdMigrate(message: Message) {
+  if (!db) {
+    await message.reply({ embeds: [errorEmbed("Database not configured — set `DATABASE_URL` first.")] });
+    return;
+  }
+  if (dbTableReady) {
+    await message.reply({
+      embeds: [new EmbedBuilder()
+        .setColor(Colors.Green)
+        .setTitle("✅ Table already exists")
+        .setDescription("The `role_assignments` table is confirmed ready. No action needed.")
+        .setTimestamp()],
+    });
+    return;
+  }
+  const pending = await message.reply({
+    embeds: [new EmbedBuilder()
+      .setColor(Colors.Yellow)
+      .setTitle("⏳ Running migrations…")
+      .setDescription("Attempting to create the `role_assignments` table. This may take a few seconds.")
+      .setTimestamp()],
+  });
+  try {
+    const { runMigrations } = await import("./migrate");
+    await runMigrations();
+    await pending.edit({
+      embeds: [new EmbedBuilder()
+        .setColor(Colors.Green)
+        .setTitle("✅ Migration complete")
+        .setDescription("The `role_assignments` table is now ready. All commands should work.")
+        .setTimestamp()],
+    });
+  } catch (err: any) {
+    const { code, message: pgMsg } = digPgError(err);
+    const detail = [code && `Code: \`${code}\``, pgMsg].filter(Boolean).join("\n");
+    await pending.edit({
+      embeds: [new EmbedBuilder()
+        .setColor(Colors.Red)
+        .setTitle("❌ Migration failed")
+        .setDescription(`Could not create the table:\n${detail || "Unknown error"}\n\nCheck Railway logs for more detail.`)
+        .setTimestamp()],
+    });
+  }
+}
+
 // ── Role change tracking ───────────────────────────────────────────────────────
 
 async function recordRoleEvent(
@@ -1327,7 +1438,17 @@ export async function startBot() {
   client.once(Events.ClientReady, (readyClient) => {
     logger.info({ tag: readyClient.user.tag }, "Discord bot logged in and ready");
     readyClient.user.setActivity("/florida", { type: ActivityType.Watching });
-    logger.info("Rich presence set: Watching /florida");
+
+    if (!db) {
+      logger.warn("Bot ready but DATABASE_URL is not set — all database commands will fail.");
+    } else if (!dbTableReady) {
+      logger.warn(
+        "Bot ready but database table may not exist — migrations may have failed. " +
+        "Check logs or use ,migrate to retry. Commands will error until the table exists."
+      );
+    } else {
+      logger.info("Bot ready and database table verified — all systems operational.");
+    }
   });
 
   // ── Track role assignments and removals ──────────────────────────────────────
@@ -1411,6 +1532,8 @@ export async function startBot() {
         await cmdStatus(message, !!db);
       } else if (lower === "logs") {
         await cmdLogs(message);
+      } else if (lower === "migrate") {
+        await cmdMigrate(message);
 
       // ── Database guard — all commands below require DATABASE_URL ────────────
       } else if (!db) {
