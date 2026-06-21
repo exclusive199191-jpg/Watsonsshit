@@ -14,6 +14,8 @@ import { db } from "@workspace/db";
 import { roleAssignmentsTable } from "@workspace/db";
 import { eq, and, desc, sql } from "drizzle-orm";
 import { logger } from "./lib/logger";
+import { isDbTableReady } from "./db-state";
+import { runMigrations } from "./migrate";
 
 // ── Permission detection ───────────────────────────────────────────────────────
 
@@ -75,12 +77,6 @@ const PG_CODES: Record<string, string> = {
   "55P03": "Database table is locked. Try again in a moment.",
   "XX000": "Internal database error.",
 };
-
-// ── DB readiness flag (set after successful migration) ─────────────────────────
-
-let dbTableReady = false;
-
-export function setDbTableReady(ready: boolean) { dbTableReady = ready; }
 
 // ── In-memory error log ────────────────────────────────────────────────────────
 
@@ -214,7 +210,7 @@ async function cmdStatus(message: Message, dbAvailable: boolean) {
   if (!dbAvailable) {
     dbStatus = "❌  Not configured — set `DATABASE_URL` in your environment";
     color = Colors.Red;
-  } else if (!dbTableReady) {
+  } else if (!isDbTableReady()) {
     dbStatus = "⚠️  Connected but table missing — migrations failed or still running";
     color = Colors.Yellow;
   } else {
@@ -224,7 +220,7 @@ async function cmdStatus(message: Message, dbAvailable: boolean) {
 
   const tableStatus = !dbAvailable
     ? "❌  N/A (no database)"
-    : dbTableReady
+    : isDbTableReady()
     ? "✅  `role_assignments` exists"
     : "⚠️  `role_assignments` table not found — run `,migrate` or check Railway logs";
 
@@ -246,7 +242,7 @@ async function cmdStatus(message: Message, dbAvailable: boolean) {
     .setFooter({
       text: !dbAvailable
         ? "Fix: add a PostgreSQL service in Railway and set DATABASE_URL."
-        : !dbTableReady
+        : !isDbTableReady()
         ? "Fix: check Railway logs for migration errors, or run ,migrate to retry."
         : "All systems operational.",
     })
@@ -1350,7 +1346,7 @@ async function cmdMigrate(message: Message) {
     await message.reply({ embeds: [errorEmbed("Database not configured — set `DATABASE_URL` first.")] });
     return;
   }
-  if (dbTableReady) {
+  if (isDbTableReady()) {
     await message.reply({
       embeds: [new EmbedBuilder()
         .setColor(Colors.Green)
@@ -1368,7 +1364,6 @@ async function cmdMigrate(message: Message) {
       .setTimestamp()],
   });
   try {
-    const { runMigrations } = await import("./migrate");
     await runMigrations();
     await pending.edit({
       embeds: [new EmbedBuilder()
@@ -1441,7 +1436,7 @@ export async function startBot() {
 
     if (!db) {
       logger.warn("Bot ready but DATABASE_URL is not set — all database commands will fail.");
-    } else if (!dbTableReady) {
+    } else if (!isDbTableReady()) {
       logger.warn(
         "Bot ready but database table may not exist — migrations may have failed. " +
         "Check logs or use ,migrate to retry. Commands will error until the table exists."

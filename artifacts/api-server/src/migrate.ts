@@ -1,12 +1,12 @@
 import { pool } from "@workspace/db";
 import { logger } from "./lib/logger";
-import { setDbTableReady } from "./bot";
+import { setDbTableReady } from "./db-state";
 
 const MAX_RETRIES = 3;
 const RETRY_DELAY_MS = 3000;
 
 async function sleep(ms: number) {
-  return new Promise((r) => setTimeout(r, ms));
+  return new Promise<void>((r) => setTimeout(r, ms));
 }
 
 export async function runMigrations() {
@@ -18,7 +18,7 @@ export async function runMigrations() {
   for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
     let client;
     try {
-      logger.info({ attempt }, "Running database migrations...");
+      logger.info(`Migration attempt ${attempt}/${MAX_RETRIES} — connecting...`);
       client = await pool.connect();
 
       await client.query(`
@@ -60,12 +60,20 @@ export async function runMigrations() {
       setDbTableReady(true);
       return;
     } catch (err: any) {
-      logger.error({ err: err?.message, code: err?.code, attempt }, "Migration attempt failed");
+      const code: string = err?.code ?? err?.cause?.code ?? "NO_CODE";
+      const msg: string = err?.message ?? err?.cause?.message ?? String(err);
+      logger.error(
+        `Migration attempt ${attempt}/${MAX_RETRIES} FAILED — [${code}] ${msg}`
+      );
       if (attempt < MAX_RETRIES) {
-        logger.info({ retryIn: RETRY_DELAY_MS }, "Retrying migration...");
+        logger.info(`Retrying migration in ${RETRY_DELAY_MS / 1000}s...`);
         await sleep(RETRY_DELAY_MS);
       } else {
-        logger.error("All migration attempts failed. Database commands will error until the table exists.");
+        logger.error(
+          `All ${MAX_RETRIES} migration attempts failed. ` +
+          `Last error: [${code}] ${msg}. ` +
+          "Database commands will error until the table exists. Run ,migrate in Discord to retry."
+        );
         throw err;
       }
     } finally {

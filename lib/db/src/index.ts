@@ -16,24 +16,24 @@ if (!url) {
 export const pool = url
   ? new Pool({
       connectionString: url,
-      // Keep connections alive so Railway/cloud infra doesn't silently kill them
+      // Railway PostgreSQL (and most cloud providers) require SSL.
+      // rejectUnauthorized:false accepts self-signed certs (standard for Railway).
+      ssl: { rejectUnauthorized: false },
+      // Keep connections alive so Railway infra doesn't silently kill them
       keepAlive: true,
       keepAliveInitialDelayMillis: 10_000,
-      // Drop idle connections after 1s — always use a fresh connection for the next query.
-      // This is the most reliable way to avoid ETIMEDOUT on Railway, which kills idle
-      // TCP connections at the infra level. A Discord bot has very low concurrency so
-      // the reconnect overhead (~50ms) is not a problem.
-      idleTimeoutMillis: 1_000,
-      // Fail fast if the DB is unreachable rather than hanging forever
-      connectionTimeoutMillis: 10_000,
-      // Small pool — this is a Discord bot, not a web server
+      // Drop idle connections after 5s to avoid ETIMEDOUT on Railway
+      idleTimeoutMillis: 5_000,
+      // Fail reasonably fast if the DB is unreachable
+      connectionTimeoutMillis: 15_000,
+      // Small pool — Discord bot has very low concurrency
       max: 5,
     })
   : null;
 
-// Silently replace dead connections instead of surfacing the error to callers
-pool?.on("error", (err) => {
-  console.error("[db] Pool error (connection will be replaced):", err.message);
+// Log pool-level errors so they appear in Railway structured logs
+pool?.on("error", (err: Error) => {
+  console.error(`[db] Pool connection error: ${err.message}`);
 });
 
 export const db = url ? drizzle(pool as pg.Pool, { schema }) : null;
