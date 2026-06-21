@@ -55,6 +55,54 @@ function getElevatedPermNames(permissions: PermissionsBitField): string[] {
     .map((perm) => ELEVATED_PERM_NAMES[String(perm)] ?? "Unknown");
 }
 
+// ── In-memory error log ────────────────────────────────────────────────────────
+
+interface ErrorLogEntry {
+  at: Date;
+  command: string;
+  message: string;
+  code?: string;
+  detail?: string;
+  stack?: string;
+}
+
+const ERROR_LOG: ErrorLogEntry[] = [];
+const MAX_LOG_SIZE = 25;
+
+function pushErrorLog(command: string, err: any) {
+  const entry: ErrorLogEntry = {
+    at: new Date(),
+    command: command.slice(0, 60),
+    message: extractFullMessage(err),
+    code: err?.cause?.code ?? err?.code,
+    detail: err?.cause?.detail ?? err?.detail,
+    stack: (err?.stack ?? "").split("\n").slice(0, 3).join(" | "),
+  };
+  ERROR_LOG.unshift(entry);
+  if (ERROR_LOG.length > MAX_LOG_SIZE) ERROR_LOG.length = MAX_LOG_SIZE;
+}
+
+/** Extract the most useful single-line message from any error, including pg errors. */
+function extractFullMessage(err: any): string {
+  // Walk up to four levels: err → err.cause → err.cause.cause → err.cause.cause.cause
+  const chain = [err, err?.cause, err?.cause?.cause, err?.cause?.cause?.cause];
+  for (const e of chain) {
+    if (!e) continue;
+    const msg: string = e?.message ?? String(e);
+    if (!msg || msg === "[object Object]") continue;
+    if (msg.startsWith("params:")) continue;
+    // "Failed query:" lines are Drizzle wrappers — skip but keep looking
+    if (msg.startsWith("Failed query:")) continue;
+    return msg.split("\n")[0];
+  }
+  // Last resort: stringify the whole error
+  try {
+    const j = JSON.stringify(err, Object.getOwnPropertyNames(err ?? {}));
+    if (j && j !== "{}") return j.slice(0, 200);
+  } catch {}
+  return "Unknown error";
+}
+
 // ── Helpers ────────────────────────────────────────────────────────────────────
 
 function ts(date: Date): string {
@@ -76,24 +124,15 @@ function errorEmbed(msg: string): EmbedBuilder {
 }
 
 /**
- * Walk an error chain and return the most meaningful single-line message.
- * DrizzleQueryError stores the real PG error in err.cause; plain pg
- * DatabaseErrors surface their message directly.  We try every layer.
+ * Return a short, user-friendly error message for Discord embeds.
+ * Uses extractFullMessage internally so it benefits from the same
+ * deep chain-walking logic.
  */
 function friendlyError(err: any): string {
-  // Walk up to three levels of cause to find a concrete message
-  for (const e of [err, err?.cause, err?.cause?.cause]) {
-    if (!e) continue;
-    const msg: string = e?.message ?? String(e);
-    if (!msg) continue;
-    // Skip drizzle wrapper lines — they carry no user-actionable info
-    if (msg.startsWith("Failed query:")) continue;
-    if (msg.startsWith("params:")) continue;
-    // Skip empty / generic Node errors
-    if (msg === "[object Object]") continue;
-    return msg.split("\n")[0];
-  }
-  return "A database error occurred. Please try again.";
+  const msg = extractFullMessage(err);
+  if (msg === "Unknown error") return "A database error occurred. Please try again.";
+  // Truncate very long messages so they fit in an embed
+  return msg.length > 300 ? msg.slice(0, 297) + "…" : msg;
 }
 
 function noDataEmbed(action: "given" | "removed", filter?: string): EmbedBuilder {
@@ -210,6 +249,7 @@ async function cmdHelp(message: Message) {
         name: "UTILITIES",
         value: [
           "`,status`  —  Show database connection, latency, and bot health",
+          "`,logs`  —  Show all recent command errors (last 25, in-memory)",
           "`,ping`  —  Bot latency",
           "`,help`  —  This command reference",
         ].join("\n"),
@@ -245,7 +285,7 @@ async function cmdRolesGiven(message: Message, args: string[]) {
 
   let records;
   if (targetId) {
-    records = await db
+    records = await db!
       .select()
       .from(roleAssignmentsTable)
       .where(and(
@@ -256,7 +296,7 @@ async function cmdRolesGiven(message: Message, args: string[]) {
       .orderBy(desc(roleAssignmentsTable.assignedAt));
   } else {
     const nameSearch = userArg.toLowerCase();
-    const all = await db
+    const all = await db!
       .select()
       .from(roleAssignmentsTable)
       .where(and(
@@ -347,8 +387,8 @@ async function cmdRolesGiven(message: Message, args: string[]) {
 
     if (i === 0) {
       await message.reply({ embeds: [embed] });
-    } else {
-      await message.channel.send({ embeds: [embed] });
+    } else if ("send" in message.channel) {
+      await (message.channel as import("discord.js").TextChannel).send({ embeds: [embed] });
     }
   }
 }
@@ -369,7 +409,7 @@ async function cmdRolesRemoved(message: Message, args: string[]) {
 
   let records;
   if (targetId) {
-    records = await db
+    records = await db!
       .select()
       .from(roleAssignmentsTable)
       .where(and(
@@ -380,7 +420,7 @@ async function cmdRolesRemoved(message: Message, args: string[]) {
       .orderBy(desc(roleAssignmentsTable.assignedAt));
   } else {
     const nameSearch = userArg.toLowerCase();
-    const all = await db
+    const all = await db!
       .select()
       .from(roleAssignmentsTable)
       .where(and(
@@ -429,7 +469,7 @@ async function cmdAllRolesGiven(message: Message) {
     return;
   }
 
-  const records = await db
+  const records = await db!
     .select()
     .from(roleAssignmentsTable)
     .where(and(
@@ -439,7 +479,7 @@ async function cmdAllRolesGiven(message: Message) {
     .orderBy(desc(roleAssignmentsTable.assignedAt))
     .limit(25);
 
-  const total = await db
+  const total = await db!
     .select({ count: sql<number>`count(*)` })
     .from(roleAssignmentsTable)
     .where(and(
@@ -478,7 +518,7 @@ async function cmdAllRolesRemoved(message: Message) {
     return;
   }
 
-  const records = await db
+  const records = await db!
     .select()
     .from(roleAssignmentsTable)
     .where(and(
@@ -488,7 +528,7 @@ async function cmdAllRolesRemoved(message: Message) {
     .orderBy(desc(roleAssignmentsTable.assignedAt))
     .limit(25);
 
-  const total = await db
+  const total = await db!
     .select({ count: sql<number>`count(*)` })
     .from(roleAssignmentsTable)
     .where(and(
@@ -530,7 +570,7 @@ async function cmdRecent(message: Message, args: string[]) {
   const rawN = parseInt(args[0] ?? "10", 10);
   const n = isNaN(rawN) || rawN < 1 ? 10 : Math.min(rawN, 50);
 
-  const records = await db
+  const records = await db!
     .select()
     .from(roleAssignmentsTable)
     .where(eq(roleAssignmentsTable.guildId, message.guild.id))
@@ -574,15 +614,15 @@ async function cmdServerStats(message: Message) {
   const guildId = message.guild.id;
 
   const [totalAssigned, totalRemoved, topGivers, topRoles] = await Promise.all([
-    db.select({ count: sql<number>`count(*)` })
+    db!.select({ count: sql<number>`count(*)` })
       .from(roleAssignmentsTable)
       .where(and(eq(roleAssignmentsTable.guildId, guildId), eq(roleAssignmentsTable.action, "assigned"))),
 
-    db.select({ count: sql<number>`count(*)` })
+    db!.select({ count: sql<number>`count(*)` })
       .from(roleAssignmentsTable)
       .where(and(eq(roleAssignmentsTable.guildId, guildId), eq(roleAssignmentsTable.action, "removed"))),
 
-    db.select({
+    db!.select({
         executorTag: roleAssignmentsTable.executorTag,
         given: sql<number>`sum(case when action = 'assigned' then 1 else 0 end)`,
         removed: sql<number>`sum(case when action = 'removed' then 1 else 0 end)`,
@@ -594,7 +634,7 @@ async function cmdServerStats(message: Message) {
       .orderBy(desc(sql`count(*)`))
       .limit(5),
 
-    db.select({
+    db!.select({
         roleName: roleAssignmentsTable.roleName,
         times: sql<number>`count(*)`,
       })
@@ -657,12 +697,12 @@ async function cmdLookup(message: Message, args: string[]) {
   const { id: targetId } = resolveUserArg(userArg);
   let records;
   if (targetId) {
-    records = await db.select().from(roleAssignmentsTable)
+    records = await db!.select().from(roleAssignmentsTable)
       .where(and(eq(roleAssignmentsTable.guildId, message.guild.id), eq(roleAssignmentsTable.targetId, targetId)))
       .orderBy(desc(roleAssignmentsTable.assignedAt));
   } else {
     const nameSearch = userArg.toLowerCase();
-    const all = await db.select().from(roleAssignmentsTable)
+    const all = await db!.select().from(roleAssignmentsTable)
       .where(eq(roleAssignmentsTable.guildId, message.guild.id))
       .orderBy(desc(roleAssignmentsTable.assignedAt));
     records = all.filter((r) => r.targetTag.toLowerCase().includes(nameSearch));
@@ -703,12 +743,12 @@ async function cmdTimeline(message: Message, args: string[]) {
   const { id: targetId } = resolveUserArg(userArg);
   let records;
   if (targetId) {
-    records = await db.select().from(roleAssignmentsTable)
+    records = await db!.select().from(roleAssignmentsTable)
       .where(and(eq(roleAssignmentsTable.guildId, message.guild.id), eq(roleAssignmentsTable.targetId, targetId)))
       .orderBy(roleAssignmentsTable.assignedAt);
   } else {
     const nameSearch = userArg.toLowerCase();
-    const all = await db.select().from(roleAssignmentsTable)
+    const all = await db!.select().from(roleAssignmentsTable)
       .where(eq(roleAssignmentsTable.guildId, message.guild.id))
       .orderBy(roleAssignmentsTable.assignedAt);
     records = all.filter((r) => r.targetTag.toLowerCase().includes(nameSearch));
@@ -745,12 +785,12 @@ async function cmdMod(message: Message, args: string[]) {
   const { id: executorId } = resolveUserArg(userArg);
   let records;
   if (executorId) {
-    records = await db.select().from(roleAssignmentsTable)
+    records = await db!.select().from(roleAssignmentsTable)
       .where(and(eq(roleAssignmentsTable.guildId, message.guild.id), eq(roleAssignmentsTable.executorId, executorId)))
       .orderBy(desc(roleAssignmentsTable.assignedAt));
   } else {
     const nameSearch = userArg.toLowerCase();
-    const all = await db.select().from(roleAssignmentsTable)
+    const all = await db!.select().from(roleAssignmentsTable)
       .where(eq(roleAssignmentsTable.guildId, message.guild.id))
       .orderBy(desc(roleAssignmentsTable.assignedAt));
     records = all.filter((r) => r.executorTag.toLowerCase().includes(nameSearch));
@@ -803,7 +843,7 @@ async function cmdBetween(message: Message, args: string[]) {
     await message.reply({ embeds: [errorEmbed("Please mention or provide IDs for both users.")] });
     return;
   }
-  const all = await db.select().from(roleAssignmentsTable)
+  const all = await db!.select().from(roleAssignmentsTable)
     .where(eq(roleAssignmentsTable.guildId, message.guild.id))
     .orderBy(desc(roleAssignmentsTable.assignedAt));
   const records = all.filter((r) =>
@@ -837,10 +877,10 @@ async function cmdMyActivity(message: Message) {
   }
   const userId = message.author.id;
   const [asExecutor, asTarget] = await Promise.all([
-    db.select().from(roleAssignmentsTable)
+    db!.select().from(roleAssignmentsTable)
       .where(and(eq(roleAssignmentsTable.guildId, message.guild.id), eq(roleAssignmentsTable.executorId, userId)))
       .orderBy(desc(roleAssignmentsTable.assignedAt)),
-    db.select().from(roleAssignmentsTable)
+    db!.select().from(roleAssignmentsTable)
       .where(and(eq(roleAssignmentsTable.guildId, message.guild.id), eq(roleAssignmentsTable.targetId, userId)))
       .orderBy(desc(roleAssignmentsTable.assignedAt)),
   ]);
@@ -878,7 +918,7 @@ async function cmdSearch(message: Message, args: string[]) {
     await message.reply({ embeds: [errorEmbed("Usage: `,search <rolename>` — find all events for a role.")] });
     return;
   }
-  const all = await db.select().from(roleAssignmentsTable)
+  const all = await db!.select().from(roleAssignmentsTable)
     .where(eq(roleAssignmentsTable.guildId, message.guild.id))
     .orderBy(desc(roleAssignmentsTable.assignedAt));
   const records = all.filter((r) => r.roleName.toLowerCase().includes(query));
@@ -913,7 +953,7 @@ async function cmdFind(message: Message, args: string[]) {
     await message.reply({ embeds: [errorEmbed("Usage: `,find <name>` — search across all usernames.")] });
     return;
   }
-  const all = await db.select().from(roleAssignmentsTable)
+  const all = await db!.select().from(roleAssignmentsTable)
     .where(eq(roleAssignmentsTable.guildId, message.guild.id))
     .orderBy(desc(roleAssignmentsTable.assignedAt));
   const records = all.filter((r) =>
@@ -985,7 +1025,7 @@ async function cmdHistory(message: Message, args: string[]) {
   const rawDays = parseInt(args[0] ?? "7", 10);
   const days = isNaN(rawDays) || rawDays < 1 ? 7 : Math.min(rawDays, 90);
   const since = new Date(Date.now() - days * 24 * 60 * 60 * 1000);
-  const all = await db.select().from(roleAssignmentsTable)
+  const all = await db!.select().from(roleAssignmentsTable)
     .where(eq(roleAssignmentsTable.guildId, message.guild.id))
     .orderBy(desc(roleAssignmentsTable.assignedAt));
   const records = all.filter((r) => new Date(r.assignedAt) >= since);
@@ -1018,7 +1058,7 @@ async function cmdActive(message: Message, args: string[]) {
   const rawDays = parseInt(args[0] ?? "7", 10);
   const days = isNaN(rawDays) || rawDays < 1 ? 7 : Math.min(rawDays, 90);
   const since = new Date(Date.now() - days * 24 * 60 * 60 * 1000);
-  const all = await db.select().from(roleAssignmentsTable)
+  const all = await db!.select().from(roleAssignmentsTable)
     .where(eq(roleAssignmentsTable.guildId, message.guild.id))
     .orderBy(desc(roleAssignmentsTable.assignedAt));
   const recent = all.filter((r) => new Date(r.assignedAt) >= since);
@@ -1051,7 +1091,7 @@ async function cmdTop(message: Message, args: string[]) {
   }
   const rawN = parseInt(args[0] ?? "10", 10);
   const n = isNaN(rawN) || rawN < 1 ? 10 : Math.min(rawN, 25);
-  const all = await db.select().from(roleAssignmentsTable)
+  const all = await db!.select().from(roleAssignmentsTable)
     .where(eq(roleAssignmentsTable.guildId, message.guild.id));
   if (!all.length) {
     await message.reply({ embeds: [new EmbedBuilder().setColor(Colors.Yellow).setTitle("No data yet").setDescription("No role events have been recorded.")] });
@@ -1081,7 +1121,7 @@ async function cmdAudit(message: Message) {
     await message.reply({ embeds: [errorEmbed("This command must be used in a server.")] });
     return;
   }
-  const all = await db.select().from(roleAssignmentsTable)
+  const all = await db!.select().from(roleAssignmentsTable)
     .where(and(eq(roleAssignmentsTable.guildId, message.guild.id), eq(roleAssignmentsTable.action, "assigned")))
     .orderBy(desc(roleAssignmentsTable.assignedAt));
 
@@ -1136,7 +1176,7 @@ async function cmdUndone(message: Message, args: string[]) {
   const hours = isNaN(rawHours) || rawHours < 1 ? 24 : Math.min(rawHours, 720);
   const windowMs = hours * 60 * 60 * 1000;
 
-  const all = await db.select().from(roleAssignmentsTable)
+  const all = await db!.select().from(roleAssignmentsTable)
     .where(eq(roleAssignmentsTable.guildId, message.guild.id))
     .orderBy(roleAssignmentsTable.assignedAt);
 
@@ -1178,7 +1218,7 @@ async function cmdExport(message: Message) {
     await message.reply({ embeds: [errorEmbed("This command must be used in a server.")] });
     return;
   }
-  const records = await db.select().from(roleAssignmentsTable)
+  const records = await db!.select().from(roleAssignmentsTable)
     .where(eq(roleAssignmentsTable.guildId, message.guild.id))
     .orderBy(desc(roleAssignmentsTable.assignedAt));
   if (!records.length) {
@@ -1200,6 +1240,45 @@ async function cmdExport(message: Message) {
   });
 }
 
+async function cmdLogs(message: Message) {
+  if (!ERROR_LOG.length) {
+    const embed = new EmbedBuilder()
+      .setColor(Colors.Green)
+      .setTitle("✅ No errors logged")
+      .setDescription("No command errors have occurred since the bot started.")
+      .setFooter({ text: `Stores up to ${MAX_LOG_SIZE} most recent errors in memory` })
+      .setTimestamp();
+    await message.reply({ embeds: [embed] });
+    return;
+  }
+
+  const lines = ERROR_LOG.map((e, i) => {
+    const discordTs = `<t:${Math.floor(e.at.getTime() / 1000)}:R>`;
+    const code = e.code ? ` [${e.code}]` : "";
+    const detail = e.detail ? `\n  ↳ ${e.detail}` : "";
+    return `**${i + 1}.** ${discordTs} — \`${e.command}\`\n  ${e.message}${code}${detail}`;
+  });
+
+  const CHUNK = 8;
+  const chunks: string[][] = [];
+  for (let i = 0; i < lines.length; i += CHUNK) chunks.push(lines.slice(i, i + CHUNK));
+
+  for (let i = 0; i < chunks.length; i++) {
+    const embed = new EmbedBuilder()
+      .setColor(Colors.Red)
+      .setTitle(i === 0 ? `🪵 Error Log — ${ERROR_LOG.length} error(s)` : "🪵 Error Log (cont.)")
+      .setDescription(chunks[i].join("\n\n"))
+      .setFooter({ text: i === 0 ? `Last ${MAX_LOG_SIZE} errors since bot start — newest first` : "" })
+      .setTimestamp();
+
+    if (i === 0) {
+      await message.reply({ embeds: [embed] });
+    } else if ("send" in message.channel) {
+      await (message.channel as import("discord.js").TextChannel).send({ embeds: [embed] });
+    }
+  }
+}
+
 // ── Role change tracking ───────────────────────────────────────────────────────
 
 async function recordRoleEvent(
@@ -1212,7 +1291,7 @@ async function recordRoleEvent(
   roleName: string,
   action: "assigned" | "removed",
 ) {
-  await db.insert(roleAssignmentsTable).values({
+  await db!.insert(roleAssignmentsTable).values({
     guildId: guild.id,
     executorId,
     executorTag,
@@ -1276,21 +1355,22 @@ export async function startBot() {
         (e) => (e.target as GuildMember | null)?.id === newMember.id
       );
 
-      if (!entry?.executor) {
+      if (!entry || !entry.executor) {
         logger.warn({ targetId: newMember.id }, "Role change detected but no audit log entry — bot may lack View Audit Log permission");
         return;
       }
 
       const executor = entry.executor;
-      const executorTag = executor.tag ?? executor.username;
+      const executorId = executor.id ?? executor.username ?? "unknown";
+      const executorTag = executor.tag ?? executor.username ?? "unknown";
       const targetTag = newMember.user.tag ?? newMember.user.username;
 
       for (const [, role] of elevatedAdded) {
-        await recordRoleEvent(guild, executor.id, executorTag, newMember.id, targetTag, role.id, role.name, "assigned");
+        await recordRoleEvent(guild, executorId, executorTag, newMember.id, targetTag, role.id, role.name, "assigned");
       }
 
       for (const [, role] of elevatedRemoved) {
-        await recordRoleEvent(guild, executor.id, executorTag, newMember.id, targetTag, role.id, role.name, "removed");
+        await recordRoleEvent(guild, executorId, executorTag, newMember.id, targetTag, role.id, role.name, "removed");
       }
     } catch (err) {
       logger.error({ err }, "Error handling GuildMemberUpdate");
@@ -1329,6 +1409,8 @@ export async function startBot() {
         await cmdHelp(message);
       } else if (lower === "status") {
         await cmdStatus(message, !!db);
+      } else if (lower === "logs") {
+        await cmdLogs(message);
 
       // ── Database guard — all commands below require DATABASE_URL ────────────
       } else if (!db) {
@@ -1419,6 +1501,7 @@ export async function startBot() {
         code,
         stack: err?.stack,
       }, "Command error");
+      pushErrorLog(lower, err);
       const clean = friendlyError(err);
       await message
         .reply({
