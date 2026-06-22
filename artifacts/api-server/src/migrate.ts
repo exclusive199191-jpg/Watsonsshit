@@ -59,7 +59,30 @@ export async function runMigrations() {
           ON role_assignments (guild_id, target_id, assigned_at DESC)
       `);
 
-      logger.info(`Database migrations complete — table is ready. (host: ${host})`);
+      // ── antinuke_config ────────────────────────────────────────────────────
+      await client.query(`
+        CREATE TABLE IF NOT EXISTS antinuke_config (
+          guild_id                  TEXT        PRIMARY KEY,
+          enabled                   BOOLEAN     NOT NULL DEFAULT FALSE,
+          log_channel_id            TEXT,
+          punishment                TEXT        NOT NULL DEFAULT 'ban',
+          whitelist                 TEXT        NOT NULL DEFAULT '[]',
+          ban_threshold             INT         NOT NULL DEFAULT 3,
+          kick_threshold            INT         NOT NULL DEFAULT 5,
+          channel_create_threshold  INT         NOT NULL DEFAULT 5,
+          channel_delete_threshold  INT         NOT NULL DEFAULT 3,
+          channel_rename_threshold  INT         NOT NULL DEFAULT 5,
+          role_delete_threshold     INT         NOT NULL DEFAULT 3,
+          role_create_threshold     INT         NOT NULL DEFAULT 5,
+          mention_threshold         INT         NOT NULL DEFAULT 10,
+          link_threshold            INT         NOT NULL DEFAULT 5,
+          webhook_threshold         INT         NOT NULL DEFAULT 2,
+          time_window_ms            INT         NOT NULL DEFAULT 10000,
+          updated_at                TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )
+      `);
+
+      logger.info(`Database migrations complete — tables are ready. (host: ${host})`);
       setDbTableReady(true);
       return;
     } catch (err: any) {

@@ -16,6 +16,7 @@ import { eq, and, desc, sql } from "drizzle-orm";
 import { logger } from "./lib/logger";
 import { isDbTableReady } from "./db-state";
 import { runMigrations } from "./migrate";
+import { registerAntiNukeListeners, handleAntiNukeCommand, handleAntiNukeMessage } from "./antinuke";
 
 // ── Permission detection ───────────────────────────────────────────────────────
 
@@ -1430,6 +1431,8 @@ export async function startBot() {
     ],
   });
 
+  registerAntiNukeListeners(client);
+
   client.once(Events.ClientReady, (readyClient) => {
     logger.info({ tag: readyClient.user.tag }, "Discord bot logged in and ready");
     readyClient.user.setActivity("/florida", { type: ActivityType.Watching });
@@ -1505,6 +1508,27 @@ export async function startBot() {
         "Go to discord.com/developers/applications → your app → Bot → " +
         "Privileged Gateway Intents → enable 'Message Content Intent' and save."
       );
+      return;
+    }
+
+    // Anti-nuke: scan every non-bot message for link spam and mass mentions
+    handleAntiNukeMessage(message).catch((err: any) => {
+      logger.error(`Anti-nuke message scan error: ${err?.message}`);
+    });
+
+    // ── ! prefix — Anti-nuke commands ────────────────────────────────────────
+    if (message.content.startsWith("!")) {
+      const anRaw   = message.content.slice(1).trim();
+      const anLower = anRaw.toLowerCase();
+      if (anLower.startsWith("antinuke")) {
+        const args = anRaw.slice("antinuke".length).trim().split(/\s+/).filter(Boolean);
+        logger.info({ author: message.author.tag, command: anLower.slice(0, 50) }, "Anti-nuke command received");
+        try {
+          await handleAntiNukeCommand(message, args);
+        } catch (err: any) {
+          logger.error(`Anti-nuke command error: ${err?.message}`);
+        }
+      }
       return;
     }
 
