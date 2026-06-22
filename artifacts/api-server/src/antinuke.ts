@@ -388,7 +388,7 @@ async function cmdEnable(message: Message): Promise<void> {
   await message.reply({ embeds: [okEmbed(
     "Anti-Nuke Enabled",
     "The anti-nuke system is now **active**. All protection thresholds are being monitored in real time.\n\n" +
-    "Use `!antinuke set logchannel #channel` to receive alerts when violations are detected."
+    "Use `-antinuke set logchannel #channel` to receive alerts when violations are detected."
   )] });
 }
 
@@ -410,7 +410,7 @@ async function cmdStatus(message: Message): Promise<void> {
   if (!config) {
     await message.reply({ embeds: [infoEmbed(
       "Anti-Nuke — Not Configured",
-      "No configuration found for this server.\nRun `!antinuke enable` to activate with default settings."
+      "No configuration found for this server.\nRun `-antinuke enable` to activate with default settings."
     )] });
     return;
   }
@@ -483,7 +483,7 @@ async function cmdSet(message: Message, args: string[]): Promise<void> {
   if (sub === "logchannel") {
     const channelId = message.mentions.channels.first()?.id ?? args[1];
     if (!channelId) {
-      await message.reply({ embeds: [errEmbed("Usage: `!antinuke set logchannel #channel`")] });
+      await message.reply({ embeds: [errEmbed("Usage: `-antinuke set logchannel #channel`")] });
       return;
     }
     await upsertConfig(message.guild.id, { logChannelId: channelId });
@@ -519,10 +519,10 @@ async function cmdSet(message: Message, args: string[]): Promise<void> {
 
   await message.reply({ embeds: [errEmbed(
     "**Usage:**\n" +
-    "`!antinuke set punishment <ban|kick|strip>`\n" +
-    "`!antinuke set logchannel #channel`\n" +
-    "`!antinuke set window <milliseconds>`\n" +
-    "`!antinuke set threshold <action> <number>`"
+    "`-antinuke set punishment <ban|kick|strip>`\n" +
+    "`-antinuke set logchannel #channel`\n" +
+    "`-antinuke set window <milliseconds>`\n" +
+    "`-antinuke set threshold <action> <number>`"
   )] });
 }
 
@@ -534,7 +534,7 @@ async function cmdWhitelist(message: Message, args: string[]): Promise<void> {
 
   if (sub === "add") {
     const userId = message.mentions.users.first()?.id ?? args[1];
-    if (!userId) { await message.reply({ embeds: [errEmbed("Usage: `!antinuke whitelist add @user`")] }); return; }
+    if (!userId) { await message.reply({ embeds: [errEmbed("Usage: `-antinuke whitelist add @user`")] }); return; }
     const config  = await getConfig(message.guild.id);
     const current = config?.whitelist ?? [];
     if (current.includes(userId)) {
@@ -548,7 +548,7 @@ async function cmdWhitelist(message: Message, args: string[]): Promise<void> {
 
   if (sub === "remove") {
     const userId = message.mentions.users.first()?.id ?? args[1];
-    if (!userId) { await message.reply({ embeds: [errEmbed("Usage: `!antinuke whitelist remove @user`")] }); return; }
+    if (!userId) { await message.reply({ embeds: [errEmbed("Usage: `-antinuke whitelist remove @user`")] }); return; }
     const config  = await getConfig(message.guild.id);
     const current = config?.whitelist ?? [];
     await upsertConfig(message.guild.id, { whitelist: JSON.stringify(current.filter(id => id !== userId)) });
@@ -570,9 +570,9 @@ async function cmdWhitelist(message: Message, args: string[]): Promise<void> {
 
   await message.reply({ embeds: [errEmbed(
     "**Usage:**\n" +
-    "`!antinuke whitelist add @user`\n" +
-    "`!antinuke whitelist remove @user`\n" +
-    "`!antinuke whitelist list`"
+    "`-antinuke whitelist add @user`\n" +
+    "`-antinuke whitelist remove @user`\n" +
+    "`-antinuke whitelist list`"
   )] });
 }
 
@@ -599,25 +599,25 @@ async function cmdHelp(message: Message): Promise<void> {
     .setDescription("Requires **Administrator** permission or server ownership.")
     .addFields(
       { name: "Toggle", value:
-        "`!antinuke enable` — Activate all protections\n" +
-        "`!antinuke disable` — Deactivate all protections\n" +
-        "`!antinuke status` — View current configuration"
+        "`-antinuke enable` — Activate all protections\n" +
+        "`-antinuke disable` — Deactivate all protections\n" +
+        "`-antinuke status` — View current configuration"
       },
       { name: "Configuration", value:
-        "`!antinuke set punishment <ban|kick|strip>` — Response for violations\n" +
-        "`!antinuke set logchannel #channel` — Where to send security alerts\n" +
-        "`!antinuke set window <ms>` — Rate-tracking window (3000 – 60000ms)\n" +
-        "`!antinuke set threshold <action> <n>` — Custom trigger threshold\n" +
-        "`!antinuke reset` — Restore all defaults"
+        "`-antinuke set punishment <ban|kick|strip>` — Response for violations\n" +
+        "`-antinuke set logchannel #channel` — Where to send security alerts\n" +
+        "`-antinuke set window <ms>` — Rate-tracking window (3000 – 60000ms)\n" +
+        "`-antinuke set threshold <action> <n>` — Custom trigger threshold\n" +
+        "`-antinuke reset` — Restore all defaults"
       },
       { name: "Threshold Actions", value:
         "`ban` `kick` `channelcreate` `channeldelete` `channelrename`\n" +
         "`roledelete` `rolecreate` `mention` `link` `webhook`"
       },
       { name: "Whitelist", value:
-        "`!antinuke whitelist add @user` — Exempt a user from detection\n" +
-        "`!antinuke whitelist remove @user` — Revoke exemption\n" +
-        "`!antinuke whitelist list` — View all exemptions"
+        "`-antinuke whitelist add @user` — Exempt a user from detection\n" +
+        "`-antinuke whitelist remove @user` — Revoke exemption\n" +
+        "`-antinuke whitelist list` — View all exemptions"
       },
       { name: "Protections", value:
         "Mass Ban · Mass Kick · Mass Channel Create/Delete/Rename\n" +

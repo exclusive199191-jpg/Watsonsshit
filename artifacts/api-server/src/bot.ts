@@ -1516,8 +1516,8 @@ export async function startBot() {
       logger.error(`Anti-nuke message scan error: ${err?.message}`);
     });
 
-    // ── ! prefix — Anti-nuke commands ────────────────────────────────────────
-    if (message.content.startsWith("!")) {
+    // ── - prefix — Anti-nuke commands ────────────────────────────────────────
+    if (message.content.startsWith("-")) {
       const anRaw   = message.content.slice(1).trim();
       const anLower = anRaw.toLowerCase();
       if (anLower.startsWith("antinuke")) {
