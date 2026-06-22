@@ -593,39 +593,86 @@ async function cmdReset(message: Message): Promise<void> {
 }
 
 async function cmdHelp(message: Message): Promise<void> {
+  await showAntiNukeHelp(message);
+}
+
+export async function showAntiNukeHelp(message: Message): Promise<void> {
+  const SEP = "▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬";
+
   const embed = new EmbedBuilder()
-    .setColor(Colors.Blurple)
-    .setTitle("Anti-Nuke — Command Reference")
-    .setDescription("Requires **Administrator** permission or server ownership.")
+    .setColor(0x2B2D31)
+    .setAuthor({ name: "Anti-Nuke System  ·  Security Module" })
+    .setTitle("Command Reference")
+    .setDescription(
+      "Protects your server against automated destruction attacks.\n" +
+      "All `-antinuke` commands require **Administrator** or server ownership.\n\n" +
+      "**Quick Setup**\n" +
+      "`-antinuke enable`  →  `-antinuke set logchannel #channel`  →  done."
+    )
     .addFields(
-      { name: "Toggle", value:
-        "`-antinuke enable` — Activate all protections\n" +
-        "`-antinuke disable` — Deactivate all protections\n" +
-        "`-antinuke status` — View current configuration"
+      {
+        name: "SYSTEM CONTROL",
+        value:
+          "`-antinuke enable`  —  Activate all active protections\n" +
+          "`-antinuke disable`  —  Deactivate the system (no actions taken)\n" +
+          "`-antinuke status`  —  View full configuration and thresholds\n" +
+          "`-antinuke reset`  —  Restore every setting to factory defaults",
       },
-      { name: "Configuration", value:
-        "`-antinuke set punishment <ban|kick|strip>` — Response for violations\n" +
-        "`-antinuke set logchannel #channel` — Where to send security alerts\n" +
-        "`-antinuke set window <ms>` — Rate-tracking window (3000 – 60000ms)\n" +
-        "`-antinuke set threshold <action> <n>` — Custom trigger threshold\n" +
-        "`-antinuke reset` — Restore all defaults"
+      { name: SEP, value: "\u200b" },
+      {
+        name: "CONFIGURATION",
+        value:
+          "`-antinuke set punishment <ban|kick|strip>`\n" +
+          "  Determines what happens to the attacker when a threshold is hit.\n" +
+          "  `ban` — permanently removes them  |  `kick` — removes from server\n" +
+          "  `strip` — revokes all elevated roles\n\n" +
+          "`-antinuke set logchannel #channel`\n" +
+          "  Channel where security alert embeds are sent on each violation.\n\n" +
+          "`-antinuke set window <ms>`\n" +
+          "  Rate-tracking window in milliseconds. Default: `10000` (10 seconds).\n" +
+          "  Range: 3000 – 60000.\n\n" +
+          "`-antinuke set threshold <action> <number>`\n" +
+          "  How many of a given action within the window triggers a response.",
       },
-      { name: "Threshold Actions", value:
-        "`ban` `kick` `channelcreate` `channeldelete` `channelrename`\n" +
-        "`roledelete` `rolecreate` `mention` `link` `webhook`"
+      { name: SEP, value: "\u200b" },
+      {
+        name: "THRESHOLD ACTIONS",
+        value:
+          "Use these with `-antinuke set threshold <action> <n>`:\n\n" +
+          "`ban`            — mass bans  *(default: 3)*\n" +
+          "`kick`           — mass kicks  *(default: 5)*\n" +
+          "`channelcreate`  — channel creation spam  *(default: 5)*\n" +
+          "`channeldelete`  — mass channel deletion  *(default: 3)*\n" +
+          "`channelrename`  — mass channel renames  *(default: 5)*\n" +
+          "`roledelete`     — mass role deletion  *(default: 3)*\n" +
+          "`rolecreate`     — mass role creation  *(default: 5)*\n" +
+          "`mention`        — mass mentions / @everyone  *(default: 10)*\n" +
+          "`link`           — link spam  *(default: 5)*\n" +
+          "`webhook`        — webhook creation spam  *(default: 2)*",
       },
-      { name: "Whitelist", value:
-        "`-antinuke whitelist add @user` — Exempt a user from detection\n" +
-        "`-antinuke whitelist remove @user` — Revoke exemption\n" +
-        "`-antinuke whitelist list` — View all exemptions"
+      { name: SEP, value: "\u200b" },
+      {
+        name: "WHITELIST",
+        value:
+          "Whitelisted users are fully exempt from all detection.\n" +
+          "Add your most trusted admins and bots here.\n\n" +
+          "`-antinuke whitelist add @user`  —  Exempt a user\n" +
+          "`-antinuke whitelist remove @user`  —  Revoke exemption\n" +
+          "`-antinuke whitelist list`  —  View all exempted users",
       },
-      { name: "Protections", value:
-        "Mass Ban · Mass Kick · Mass Channel Create/Delete/Rename\n" +
-        "Mass Role Create/Delete · Mass Role Grant · Webhook Spam\n" +
-        "Link Spam · Mass Mention / @everyone"
+      { name: SEP, value: "\u200b" },
+      {
+        name: "PROTECTIONS OVERVIEW",
+        value:
+          "The following actions are monitored in real time:\n\n" +
+          "Mass Ban  ·  Mass Kick  ·  Mass Channel Create\n" +
+          "Mass Channel Delete  ·  Mass Channel Rename\n" +
+          "Mass Role Create  ·  Mass Role Delete  ·  Mass Role Grant\n" +
+          "Webhook Creation Spam  ·  Link Spam  ·  Mass Mention / @everyone\n\n" +
+          "Server owner and bots are always skipped. Bot role hierarchy is respected.",
       },
     )
-    .setFooter({ text: "Anti-Nuke System" })
+    .setFooter({ text: "-help  ·  Anti-Nuke System  ·  All times in UTC" })
     .setTimestamp();
 
   await message.reply({ embeds: [embed] });

@@ -16,7 +16,7 @@ import { eq, and, desc, sql } from "drizzle-orm";
 import { logger } from "./lib/logger";
 import { isDbTableReady } from "./db-state";
 import { runMigrations } from "./migrate";
-import { registerAntiNukeListeners, handleAntiNukeCommand, handleAntiNukeMessage } from "./antinuke";
+import { registerAntiNukeListeners, handleAntiNukeCommand, handleAntiNukeMessage, showAntiNukeHelp } from "./antinuke";
 
 // ── Permission detection ───────────────────────────────────────────────────────
 
@@ -1520,7 +1520,14 @@ export async function startBot() {
     if (message.content.startsWith("-")) {
       const anRaw   = message.content.slice(1).trim();
       const anLower = anRaw.toLowerCase();
-      if (anLower.startsWith("antinuke")) {
+      if (anLower === "help") {
+        logger.info({ author: message.author.tag }, "Anti-nuke help requested");
+        try {
+          await showAntiNukeHelp(message);
+        } catch (err: any) {
+          logger.error(`Anti-nuke help error: ${err?.message}`);
+        }
+      } else if (anLower.startsWith("antinuke")) {
         const args = anRaw.slice("antinuke".length).trim().split(/\s+/).filter(Boolean);
         logger.info({ author: message.author.tag, command: anLower.slice(0, 50) }, "Anti-nuke command received");
         try {
