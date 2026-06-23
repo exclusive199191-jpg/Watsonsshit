@@ -82,14 +82,24 @@ export async function runMigrations() {
         )
       `);
 
+      // New antinuke_config columns (idempotent)
+      await client.query(`ALTER TABLE antinuke_config ADD COLUMN IF NOT EXISTS toggles TEXT NOT NULL DEFAULT '{}'`);
+      await client.query(`ALTER TABLE antinuke_config ADD COLUMN IF NOT EXISTS unban_threshold INT NOT NULL DEFAULT 3`);
+      await client.query(`ALTER TABLE antinuke_config ADD COLUMN IF NOT EXISTS emoji_delete_threshold INT NOT NULL DEFAULT 5`);
+      await client.query(`ALTER TABLE antinuke_config ADD COLUMN IF NOT EXISTS raid_join_threshold INT NOT NULL DEFAULT 10`);
+      await client.query(`ALTER TABLE antinuke_config ADD COLUMN IF NOT EXISTS raid_join_window_ms INT NOT NULL DEFAULT 30000`);
+      await client.query(`ALTER TABLE antinuke_config ADD COLUMN IF NOT EXISTS emergency_mode BOOLEAN NOT NULL DEFAULT FALSE`);
+
       await client.query(`
         CREATE TABLE IF NOT EXISTS guild_snapshots (
           guild_id      TEXT        PRIMARY KEY,
           channels_json TEXT        NOT NULL DEFAULT '[]',
           roles_json    TEXT        NOT NULL DEFAULT '[]',
+          guild_name    TEXT        NOT NULL DEFAULT '',
           taken_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
         )
       `);
+      await client.query(`ALTER TABLE guild_snapshots ADD COLUMN IF NOT EXISTS guild_name TEXT NOT NULL DEFAULT ''`);
 
       logger.info(`Database migrations complete — tables are ready. (host: ${host})`);
       setDbTableReady(true);

@@ -8,6 +8,7 @@ import {
   PermissionsBitField,
   type Client,
   type Guild,
+  type GuildMember,
   type User,
   type PartialUser,
   type Message,
@@ -22,6 +23,31 @@ import { eq } from "drizzle-orm";
 import { logger } from "./lib/logger";
 
 type AnyUser = User | PartialUser;
+
+// ── In-memory incident log (per guild, max 25, newest first) ─────────────────
+
+interface Incident {
+  at: Date;
+  violation: string;
+  executorId: string;
+  executorTag: string;
+  count: number;
+  threshold: number;
+  result: string;
+}
+const incidentLog = new Map<string, Incident[]>();
+const MAX_INCIDENTS = 25;
+
+function recordIncident(guildId: string, inc: Omit<Incident, "at">): void {
+  const log = incidentLog.get(guildId) ?? [];
+  log.unshift({ ...inc, at: new Date() });
+  if (log.length > MAX_INCIDENTS) log.length = MAX_INCIDENTS;
+  incidentLog.set(guildId, log);
+}
+
+// ── Join tracker for raid detection (per guild) ───────────────────────────────
+
+const joinTracker = new Map<string, number[]>(); // guildId → join timestamps
 
 // ── Sliding-window rate tracker ─────────────────────────────────────────────
 // Uses per-action timestamp queues so async/delayed burst attacks are caught
@@ -46,11 +72,23 @@ function resetRate(guildId: string, userId: string, action: string): void {
 
 // ── Config cache ────────────────────────────────────────────────────────────
 
+// All toggleable action keys — used by cmdToggle and checkToggle
+const TOGGLE_KEYS = [
+  "ban", "kick", "chCreate", "chDelete", "chRename",
+  "roleDelete", "roleCreate", "roleGrant",
+  "webhook", "webhookDelete",
+  "mention", "link",
+  "unban", "emojiDelete",
+  "raidJoin", "botAdd", "guildUpdate",
+] as const;
+type ToggleKey = typeof TOGGLE_KEYS[number];
+
 interface AntiNukeConfig {
   enabled: boolean;
   logChannelId: string | null;
   punishment: "ban" | "kick" | "strip";
   whitelist: string[];
+  toggles: Partial<Record<ToggleKey, boolean>>;
   banThreshold: number;
   kickThreshold: number;
   channelCreateThreshold: number;
@@ -61,7 +99,16 @@ interface AntiNukeConfig {
   mentionThreshold: number;
   linkThreshold: number;
   webhookThreshold: number;
+  unbanThreshold: number;
+  emojiDeleteThreshold: number;
+  raidJoinThreshold: number;
+  raidJoinWindowMs: number;
   timeWindowMs: number;
+  emergencyMode: boolean;
+}
+
+function checkToggle(config: AntiNukeConfig, key: ToggleKey): boolean {
+  return config.toggles[key] !== false; // default true if not explicitly disabled
 }
 
 const configCache = new Map<string, { config: AntiNukeConfig; fetchedAt: number }>();
@@ -82,12 +129,15 @@ async function getConfig(guildId: string): Promise<AntiNukeConfig | null> {
   const r = rows[0];
   let whitelist: string[] = [];
   try { whitelist = JSON.parse(r.whitelist ?? "[]"); } catch { whitelist = []; }
+  let toggles: Partial<Record<ToggleKey, boolean>> = {};
+  try { toggles = JSON.parse((r as any).toggles ?? "{}"); } catch { toggles = {}; }
 
   const config: AntiNukeConfig = {
     enabled: r.enabled,
     logChannelId: r.logChannelId ?? null,
     punishment: (r.punishment as "ban" | "kick" | "strip") ?? "ban",
     whitelist,
+    toggles,
     banThreshold: r.banThreshold,
     kickThreshold: r.kickThreshold,
     channelCreateThreshold: r.channelCreateThreshold,
@@ -98,7 +148,12 @@ async function getConfig(guildId: string): Promise<AntiNukeConfig | null> {
     mentionThreshold: r.mentionThreshold,
     linkThreshold: r.linkThreshold,
     webhookThreshold: r.webhookThreshold,
+    unbanThreshold: (r as any).unbanThreshold ?? 3,
+    emojiDeleteThreshold: (r as any).emojiDeleteThreshold ?? 5,
+    raidJoinThreshold: (r as any).raidJoinThreshold ?? 10,
+    raidJoinWindowMs: (r as any).raidJoinWindowMs ?? 30000,
     timeWindowMs: r.timeWindowMs,
+    emergencyMode: (r as any).emergencyMode ?? false,
   };
 
   configCache.set(guildId, { config, fetchedAt: Date.now() });
@@ -208,6 +263,7 @@ export async function takeSnapshot(guild: Guild): Promise<void> {
       .insert(guildSnapshotTable)
       .values({
         guildId: guild.id,
+        guildName: guild.name,
         channelsJson: JSON.stringify(channels),
         rolesJson: JSON.stringify(roles),
         takenAt: new Date(),
@@ -215,6 +271,7 @@ export async function takeSnapshot(guild: Guild): Promise<void> {
       .onConflictDoUpdate({
         target: guildSnapshotTable.guildId,
         set: {
+          guildName: guild.name,
           channelsJson: JSON.stringify(channels),
           rolesJson: JSON.stringify(roles),
           takenAt: new Date(),
@@ -552,6 +609,15 @@ async function handleViolation(
     logger.error(`Anti-nuke punishment error: ${err?.message}`);
   }
 
+  recordIncident(guild.id, {
+    violation: violationLabel,
+    executorId: executor.id,
+    executorTag: executorLabel,
+    count,
+    threshold,
+    result,
+  });
+
   logger.warn(
     `Anti-nuke triggered | guild: ${guild.id} | executor: ${executorLabel} (${executor.id}) | ` +
     `violation: ${violationLabel} | count: ${count}/${threshold} | result: ${result}`
@@ -606,30 +672,42 @@ async function onAuditLogEntry(entry: GuildAuditLogsEntry, guild: Guild): Promis
 
   switch (entry.action) {
     case AuditLogEvent.MemberBanAdd: {
+      if (!checkToggle(config, "ban")) break;
       const n = tick(guild.id, executorId, "ban", w);
       if (n >= config.banThreshold)
         await handleViolation(guild, entry.executor, config, "ban", "Mass Ban", n, config.banThreshold);
       break;
     }
+    case AuditLogEvent.MemberBanRemove: {
+      if (!checkToggle(config, "unban")) break;
+      const n = tick(guild.id, executorId, "unban", w);
+      if (n >= config.unbanThreshold)
+        await handleViolation(guild, entry.executor, config, "unban", "Mass Unban", n, config.unbanThreshold);
+      break;
+    }
     case AuditLogEvent.MemberKick: {
+      if (!checkToggle(config, "kick")) break;
       const n = tick(guild.id, executorId, "kick", w);
       if (n >= config.kickThreshold)
         await handleViolation(guild, entry.executor, config, "kick", "Mass Kick", n, config.kickThreshold);
       break;
     }
     case AuditLogEvent.ChannelCreate: {
+      if (!checkToggle(config, "chCreate")) break;
       const n = tick(guild.id, executorId, "chCreate", w);
       if (n >= config.channelCreateThreshold)
         await handleViolation(guild, entry.executor, config, "chCreate", "Mass Channel Create", n, config.channelCreateThreshold);
       break;
     }
     case AuditLogEvent.ChannelDelete: {
+      if (!checkToggle(config, "chDelete")) break;
       const n = tick(guild.id, executorId, "chDelete", w);
       if (n >= config.channelDeleteThreshold)
         await handleViolation(guild, entry.executor, config, "chDelete", "Mass Channel Delete", n, config.channelDeleteThreshold);
       break;
     }
     case AuditLogEvent.ChannelUpdate: {
+      if (!checkToggle(config, "chRename")) break;
       const changes = entry.changes as ReadonlyArray<{ key: string }>;
       if (!changes.some(c => c.key === "name")) break;
       const n = tick(guild.id, executorId, "chRename", w);
@@ -638,24 +716,36 @@ async function onAuditLogEntry(entry: GuildAuditLogsEntry, guild: Guild): Promis
       break;
     }
     case AuditLogEvent.RoleDelete: {
+      if (!checkToggle(config, "roleDelete")) break;
       const n = tick(guild.id, executorId, "roleDelete", w);
       if (n >= config.roleDeleteThreshold)
         await handleViolation(guild, entry.executor, config, "roleDelete", "Mass Role Delete", n, config.roleDeleteThreshold);
       break;
     }
     case AuditLogEvent.RoleCreate: {
+      if (!checkToggle(config, "roleCreate")) break;
       const n = tick(guild.id, executorId, "roleCreate", w);
       if (n >= config.roleCreateThreshold)
         await handleViolation(guild, entry.executor, config, "roleCreate", "Mass Role Create", n, config.roleCreateThreshold);
       break;
     }
     case AuditLogEvent.WebhookCreate: {
+      if (!checkToggle(config, "webhook")) break;
       const n = tick(guild.id, executorId, "webhook", w);
       if (n >= config.webhookThreshold)
         await handleViolation(guild, entry.executor, config, "webhook", "Webhook Creation Spam", n, config.webhookThreshold);
       break;
     }
+    case AuditLogEvent.WebhookDelete:
+    case AuditLogEvent.WebhookUpdate: {
+      if (!checkToggle(config, "webhookDelete")) break;
+      const n = tick(guild.id, executorId, "webhookDelete", w);
+      if (n >= config.webhookThreshold)
+        await handleViolation(guild, entry.executor, config, "webhookDelete", "Webhook Deletion/Modification", n, config.webhookThreshold);
+      break;
+    }
     case AuditLogEvent.MemberRoleUpdate: {
+      if (!checkToggle(config, "roleGrant")) break;
       const changes = entry.changes as ReadonlyArray<{ key: string; new?: unknown }>;
       const hasGrant = changes.some(c => c.key === "$add" && Array.isArray(c.new) && (c.new as unknown[]).length > 0);
       if (!hasGrant) break;
@@ -663,6 +753,94 @@ async function onAuditLogEntry(entry: GuildAuditLogsEntry, guild: Guild): Promis
       if (n >= 5)
         await handleViolation(guild, entry.executor, config, "roleGrant", "Mass Role Grant", n, 5);
       break;
+    }
+    case AuditLogEvent.EmojiDelete:
+    case AuditLogEvent.StickerDelete: {
+      if (!checkToggle(config, "emojiDelete")) break;
+      const n = tick(guild.id, executorId, "emojiDelete", w);
+      if (n >= config.emojiDeleteThreshold)
+        await handleViolation(guild, entry.executor, config, "emojiDelete", "Mass Emoji/Sticker Delete", n, config.emojiDeleteThreshold);
+      break;
+    }
+    case AuditLogEvent.GuildUpdate: {
+      if (!checkToggle(config, "guildUpdate")) break;
+      const changes = entry.changes as ReadonlyArray<{ key: string; old?: unknown; new?: unknown }>;
+      const sensitiveKeys = ["name", "vanity_url_code", "owner_id", "mfa_level", "verification_level"];
+      const hit = changes.find(c => sensitiveKeys.includes(c.key));
+      if (!hit) break;
+      const label = hit.key === "name" ? "Server Name Changed"
+                  : hit.key === "vanity_url_code" ? "Vanity URL Changed"
+                  : hit.key === "owner_id" ? "Ownership Transferred"
+                  : "Critical Server Setting Changed";
+      // Attempt to revert server name changes
+      if (hit.key === "name" && hit.old && typeof hit.old === "string") {
+        guild.setName(hit.old as string, "Anti-nuke: reverting server name change").catch(() => null);
+      }
+      await handleViolation(guild, entry.executor, config, "guildUpdate", label, 1, 1);
+      break;
+    }
+    case AuditLogEvent.BotAdd: {
+      if (!checkToggle(config, "botAdd")) break;
+      // The target is the bot that was added
+      const botId = (entry.target as { id?: string } | null)?.id;
+      if (botId && !config.whitelist.includes(botId)) {
+        const bot = await guild.members.fetch(botId).catch(() => null);
+        if (bot?.user.bot) {
+          await bot.kick("Anti-nuke: unauthorized bot addition").catch(() => null);
+        }
+        await handleViolation(guild, entry.executor, config, "botAdd", "Unauthorized Bot Added", 1, 1);
+      }
+      break;
+    }
+  }
+}
+
+// ── Raid detection (join flood) ───────────────────────────────────────────────
+
+export async function onGuildMemberAdd(member: GuildMember): Promise<void> {
+  const guild = member.guild;
+  const config = await getConfig(guild.id);
+  if (!config?.enabled) return;
+
+  // ── Raid join flood ──────────────────────────────────────────────────────
+  if (checkToggle(config, "raidJoin")) {
+    const now = Date.now();
+    const prev = joinTracker.get(guild.id) ?? [];
+    const within = prev.filter(t => now - t <= config.raidJoinWindowMs);
+    within.push(now);
+    joinTracker.set(guild.id, within);
+
+    if (within.length >= config.raidJoinThreshold) {
+      joinTracker.delete(guild.id);
+      recordIncident(guild.id, {
+        violation: "Raid Join Flood",
+        executorId: "raid",
+        executorTag: "Raid",
+        count: within.length,
+        threshold: config.raidJoinThreshold,
+        result: "lockdown",
+      });
+      logger.warn(`Raid detected in guild ${guild.id} — ${within.length} joins in ${config.raidJoinWindowMs / 1000}s`);
+
+      if (config.logChannelId) {
+        const ch = guild.channels.cache.get(config.logChannelId);
+        if (ch && "send" in ch) {
+          await (ch as TextChannel).send({
+            embeds: [
+              new EmbedBuilder()
+                .setColor(Colors.DarkRed)
+                .setTitle("RAID DETECTED")
+                .setDescription(
+                  `**${within.length}** accounts joined **${guild.name}** within **${config.raidJoinWindowMs / 1000}s**.\n` +
+                  `Threshold: ${config.raidJoinThreshold} joins in ${config.raidJoinWindowMs / 1000}s.\n\n` +
+                  `Use \`-antinuke lockdown\` to lock the server immediately.`
+                )
+                .setFooter({ text: "Anti-Nuke System  ·  Raid Detection" })
+                .setTimestamp(),
+            ],
+          }).catch(() => null);
+        }
+      }
     }
   }
 }
@@ -815,6 +993,8 @@ const ACTION_FIELD_MAP: Record<string, keyof ConfigPatch & string> = {
   mention:       "mentionThreshold",
   link:          "linkThreshold",
   webhook:       "webhookThreshold",
+  unban:         "unbanThreshold",
+  emojidelete:   "emojiDeleteThreshold",
 };
 
 async function cmdSet(message: Message, args: string[]): Promise<void> {
@@ -939,7 +1119,10 @@ async function cmdReset(message: Message): Promise<void> {
     channelDeleteThreshold: 3, channelRenameThreshold: 5, roleDeleteThreshold: 3,
     roleCreateThreshold: 5, mentionThreshold: 10, linkThreshold: 5,
     webhookThreshold: 2, timeWindowMs: 10_000,
-  });
+    unbanThreshold: 3, emojiDeleteThreshold: 5,
+    raidJoinThreshold: 10, raidJoinWindowMs: 30_000,
+    emergencyMode: false,
+  } as any);
   await message.reply({ embeds: [okEmbed(
     "Anti-Nuke Reset",
     "All settings have been restored to defaults. Anti-nuke is now **disabled**."
@@ -981,6 +1164,126 @@ async function cmdRestore(message: Message): Promise<void> {
   });
 }
 
+// ── Toggle command ───────────────────────────────────────────────────────────
+
+async function cmdToggle(message: Message, args: string[]): Promise<void> {
+  if (!message.guild) return;
+  if (!db) { await message.reply({ embeds: [errEmbed("Database not configured.")] }); return; }
+
+  const key = args[0]?.toLowerCase();
+  const val  = args[1]?.toLowerCase();
+
+  if (!key || !val) {
+    const keyList = TOGGLE_KEYS.join(" · ");
+    await message.reply({ embeds: [errEmbed(
+      "**Usage:** `-antinuke toggle <action> <on|off>`\n\n" +
+      `**Actions:** ${keyList}`
+    )] });
+    return;
+  }
+
+  if (!TOGGLE_KEYS.includes(key as ToggleKey)) {
+    await message.reply({ embeds: [errEmbed(`Unknown action key: \`${key}\`\nValid: ${TOGGLE_KEYS.join(", ")}`)] });
+    return;
+  }
+
+  if (val !== "on" && val !== "off") {
+    await message.reply({ embeds: [errEmbed("Value must be `on` or `off`.")] });
+    return;
+  }
+
+  const config = await getConfig(message.guild.id);
+  const toggles = config?.toggles ?? {};
+  (toggles as Record<string, boolean>)[key] = val === "on";
+  await upsertConfig(message.guild.id, { toggles: JSON.stringify(toggles) } as any);
+  await message.reply({ embeds: [okEmbed("Toggle Updated", `Detection for **${key}** is now **${val}**.`)] });
+}
+
+// ── Stats command ────────────────────────────────────────────────────────────
+
+async function cmdStats(message: Message): Promise<void> {
+  if (!message.guild) return;
+
+  const incidents = incidentLog.get(message.guild.id) ?? [];
+
+  const embed = new EmbedBuilder()
+    .setColor(0x2B2D31)
+    .setTitle("Anti-Nuke — Incident Stats")
+    .setDescription(
+      incidents.length === 0
+        ? "No incidents recorded in this session."
+        : `Last **${incidents.length}** incident(s):`
+    );
+
+  if (incidents.length > 0) {
+    const lines = incidents.slice(0, 10).map((inc, i) => {
+      const ts = `<t:${Math.floor(inc.at.getTime() / 1000)}:R>`;
+      return `\`${String(i + 1).padStart(2, "0")}\` ${ts} **${inc.violation}** — <@${inc.executorId}> (${inc.count}/${inc.threshold}) → ${inc.result}`;
+    });
+    embed.addFields({ name: "Recent Incidents", value: lines.join("\n"), inline: false });
+  }
+
+  embed.setFooter({ text: "Anti-Nuke System  ·  Resets on bot restart" }).setTimestamp();
+  await message.reply({ embeds: [embed] });
+}
+
+// ── Lockdown command ─────────────────────────────────────────────────────────
+
+async function cmdLockdown(message: Message): Promise<void> {
+  if (!message.guild) return;
+
+  const guild = message.guild;
+  const pending = await message.reply({ embeds: [infoEmbed("Lockdown In Progress…", "Removing Send Messages from @everyone in all channels…")] });
+
+  let count = 0;
+  const errs: string[] = [];
+  for (const channel of guild.channels.cache.values()) {
+    if (!("permissionOverwrites" in channel)) continue;
+    try {
+      await (channel as GuildChannel).permissionOverwrites.edit(
+        guild.roles.everyone,
+        { SendMessages: false },
+        { reason: "Anti-nuke manual lockdown" }
+      );
+      count++;
+    } catch { errs.push(channel.id); }
+  }
+
+  await pending.edit({ embeds: [okEmbed(
+    "Server Locked Down",
+    `Locked **${count}** channel(s). ${errs.length > 0 ? `\nCould not lock ${errs.length} channel(s) (missing permissions).` : ""}\n\n` +
+    "Use `-antinuke unlock` to restore normal access."
+  )] });
+}
+
+// ── Unlock command ───────────────────────────────────────────────────────────
+
+async function cmdUnlock(message: Message): Promise<void> {
+  if (!message.guild) return;
+
+  const guild = message.guild;
+  const pending = await message.reply({ embeds: [infoEmbed("Unlocking Server…", "Restoring @everyone Send Messages permissions…")] });
+
+  let count = 0;
+  const errs: string[] = [];
+  for (const channel of guild.channels.cache.values()) {
+    if (!("permissionOverwrites" in channel)) continue;
+    try {
+      await (channel as GuildChannel).permissionOverwrites.edit(
+        guild.roles.everyone,
+        { SendMessages: null },
+        { reason: "Anti-nuke manual unlock" }
+      );
+      count++;
+    } catch { errs.push(channel.id); }
+  }
+
+  await pending.edit({ embeds: [okEmbed(
+    "Server Unlocked",
+    `Restored permissions in **${count}** channel(s).${errs.length > 0 ? `\nCould not unlock ${errs.length} channel(s) (missing permissions).` : ""}`
+  )] });
+}
+
 async function cmdHelp(message: Message): Promise<void> {
   await showAntiNukeHelp(message);
 }
@@ -997,40 +1300,52 @@ export async function showAntiNukeHelp(message: Message): Promise<void> {
       {
         name: "Control",
         value:
-          "`-antinuke enable` / `disable` / `status` / `reset`",
+          "`enable` · `disable` · `status` · `reset`\n" +
+          "`lockdown` — lock all channels immediately\n" +
+          "`unlock` — restore channel access",
         inline: false,
       },
       {
         name: "Snapshot & Restore",
         value:
-          "`-antinuke snapshot` — save server layout (auto every 5 min)\n" +
-          "`-antinuke restore` — rebuild missing channels/roles from snapshot",
+          "`snapshot` — save server layout (auto every 5 min)\n" +
+          "`restore` — rebuild missing channels/roles from snapshot",
         inline: false,
       },
       {
         name: "Settings",
         value:
-          "`-antinuke set punishment <ban|kick|strip>`\n" +
-          "`-antinuke set logchannel #channel`\n" +
-          "`-antinuke set window <ms>` — default 10000 (10s)\n" +
-          "`-antinuke set threshold <action> <n>`",
+          "`set punishment <ban|kick|strip>`\n" +
+          "`set logchannel #channel`\n" +
+          "`set window <ms>` — default 10 000ms\n" +
+          "`set threshold <action> <n>` — see Threshold actions below",
         inline: false,
       },
       {
         name: "Threshold actions",
         value:
-          "`ban` · `kick` · `channelcreate` · `channeldelete` · `channelrename`\n" +
-          "`roledelete` · `rolecreate` · `mention` · `link` · `webhook`",
+          "`ban` · `kick` · `unban` · `channelcreate` · `channeldelete` · `channelrename`\n" +
+          "`roledelete` · `rolecreate` · `mention` · `link` · `webhook` · `emojidelete`",
         inline: false,
       },
       {
-        name: "Whitelist",
+        name: "Per-action toggles",
         value:
-          "`-antinuke whitelist add/remove @user` · `list`",
+          "`toggle <key> on|off` — enable/disable individual detections\n" +
+          "Keys: `ban` `kick` `unban` `chCreate` `chDelete` `chRename`\n" +
+          "`roleDelete` `roleCreate` `roleGrant` `webhook` `webhookDelete`\n" +
+          "`mention` `link` `emojiDelete` `raidJoin` `botAdd` `guildUpdate`",
+        inline: false,
+      },
+      {
+        name: "Whitelist & Stats",
+        value:
+          "`whitelist add/remove @user` · `whitelist list`\n" +
+          "`stats` — view recent incident log",
         inline: false,
       },
     )
-    .setFooter({ text: "Anti-Nuke System" })
+    .setFooter({ text: "Anti-Nuke System  ·  Prefix: -antinuke" })
     .setTimestamp();
 
   await message.reply({ embeds: [embed] });
@@ -1046,6 +1361,14 @@ export function registerAntiNukeListeners(client: Client): void {
       await onAuditLogEntry(entry as GuildAuditLogsEntry, guild);
     } catch (err: any) {
       logger.error(`Anti-nuke audit log error: ${err?.message}`);
+    }
+  });
+
+  client.on(Events.GuildMemberAdd, async (member) => {
+    try {
+      await onGuildMemberAdd(member as GuildMember);
+    } catch (err: any) {
+      logger.error(`Anti-nuke member add error: ${err?.message}`);
     }
   });
 }
@@ -1093,6 +1416,10 @@ export async function handleAntiNukeCommand(message: Message, args: string[]): P
     case "reset":     return cmdReset(message);
     case "snapshot":  return cmdSnapshot(message);
     case "restore":   return cmdRestore(message);
+    case "toggle":    return cmdToggle(message, args.slice(1));
+    case "stats":     return cmdStats(message);
+    case "lockdown":  return cmdLockdown(message);
+    case "unlock":    return cmdUnlock(message);
     default:          return cmdHelp(message);
   }
 }

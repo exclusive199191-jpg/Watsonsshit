@@ -1,0 +1,51 @@
+Create the best possible private/self-hosted Discord anti-nuke bot from scratch. Make it production-ready, highly secure, fast, and feature-complete. Use the latest stable version of discord.js v14 (Node.js) with proper intents, or discord.py if Python is better for async performance—choose whichever allows the most reliable real-time protection. Structure the code professionally with separate files/folders for events, commands, handlers, config, and utils. Use dotenv for secrets, MongoDB (or better alternative like quick.db / better-sqlite3 for simplicity on Replit) for persistent storage of whitelists, settings, and logs.
+Core Goal
+Build an enterprise-grade Anti-Nuke / Anti-Raid / Anti-Abuse bot that detects and stops server nuking (mass deletes, bans, role/permission changes, webhooks, etc.) in real-time using Discord audit logs. Automatically punish offenders, recover where possible, log everything, and allow full owner/admin configuration.
+Must-Have Features (Implement ALL)
+•  Whitelist System: Owner-only commands to add/remove trusted users/roles with categories (e.g., full admin, limited, bot owner). Bypass all protections for whitelisted.
+•  Configurable Thresholds & Limits (per action, stored in DB):
+	•  Max actions per minute (e.g., 3 bans/kicks/channels in 60s triggers punishment).
+	•  Custom punishment levels: Warn → Timeout → Kick → Ban (with options per action type).
+•  Protected Actions (monitor via audit logs + events):
+	•  Anti Ban / Unban / Kick / Member Update (dangerous perms).
+	•  Anti Channel Create/Delete/Update (recover by cloning with permissions).
+	•  Anti Role Create/Delete/Update (recover roles).
+	•  Anti Webhook Create/Delete/Update.
+	•  Anti Guild Update (vanity URL sniping/revert if possible, server name/icon changes).
+	•  Anti Bot Add (auto-remove unauthorized bots).
+	•  Anti Emoji/Sticker Create/Delete.
+	•  Anti Mass Mentions / Invite spam / Raid joins (join velocity detection).
+•  Automatic Recovery: Restore deleted channels/roles with original permissions, names, topics where feasible. Backup server config periodically.
+•  Punishment & Response: Ban/timeout the executor immediately if thresholds exceeded. Option to DM them or log publicly. Emergency mode: Lock server (revoke perms) on severe nukes.
+•  Logging: Dedicated log channel (configurable). Detailed embeds with executor, action, timestamp, before/after states. Webhook logging for reliability.
+•  Commands (Slash commands + prefix fallback, admin/owner restricted):
+	•  /antinuke setup — Initial setup wizard (log channel, thresholds, etc.).
+	•  /antinuke whitelist add/remove/list [user/role] [category]
+	•  /antinuke config [action] [threshold/time/punishment]
+	•  /antinuke toggle [action] on/off
+	•  /antinuke backup / restore
+	•  /antinuke stats — Recent incidents, protected actions count.
+	•  Owner-only: Bot token management, global blacklist, etc.
+	•  Help menu with embeds.
+•  Extra Security:
+	•  Rate limiting on commands.
+	•  Bot permissions check (needs high perms: Administrator or specific).
+	•  Vanity URL protection (monitor and revert changes).
+	•  Anti-token grabber / selfbot detection if possible.
+	•  Error handling, restarts gracefully.
+	•  Uptime monitoring suggestion (Replit deployment).
+Tech & Best Practices
+•  Proper sharding if needed, but start simple.
+•  Use Gateway Intents: Guilds, GuildMembers, GuildBans, GuildModeration (Audit Logs), etc.
+•  Event listeners: guildAuditLogEntryCreate, member ban/kick events, channel/role create/delete/update.
+•  Caching for speed (e.g., recent actions map).
+•  Clean, commented, modular code. Include README.md with full setup instructions: Invite link, permissions needed, .env example, MongoDB/Replit DB setup, how to run 24/7 on Replit.
+•  Security: Never log tokens, validate inputs, prevent command injection.
+•  Make it beautiful: Use Discord embeds, colors, thumbnails consistently.
+•  Test for edge cases: High load, bot lacking perms, false positives (whitelist works).
+Additional Polish
+•  Make thresholds adjustable per-server.
+•  Add anti-raid join flood detection (e.g., 10+ new members in 30s).
+•  Include a simple dashboard command or suggest web dashboard integration.
+•  Performance: Optimize for low latency.
+•  After generating core, provide commands to test each feature.
