@@ -245,9 +245,18 @@ function delay(ms: number): Promise<void> {
   return new Promise(r => setTimeout(r, ms));
 }
 
-// Restore the server from a snapshot after a nuke event.
-// Recreates missing roles then missing channels (categories first, then others)
-// with correct parent categories and identical permission overwrites.
+// Permissions to lock on @everyone while a restore is in progress,
+// so any remaining attacker cannot interfere mid-flight.
+const LOCKDOWN_DENY = [
+  PermissionsBitField.Flags.ManageChannels,
+  PermissionsBitField.Flags.ManageRoles,
+  PermissionsBitField.Flags.ManageGuild,
+  PermissionsBitField.Flags.Administrator,
+  PermissionsBitField.Flags.BanMembers,
+  PermissionsBitField.Flags.KickMembers,
+  PermissionsBitField.Flags.ManageWebhooks,
+];
+
 async function restoreFromSnapshot(guild: Guild, config: AntiNukeConfig): Promise<void> {
   const snap = await loadSnapshot(guild.id);
   if (!snap) {
@@ -260,139 +269,182 @@ async function restoreFromSnapshot(guild: Guild, config: AntiNukeConfig): Promis
   await guild.roles.fetch();
   await guild.channels.fetch();
 
-  // ── Restore roles ────────────────────────────────────────────────────────
-  // Map: old role ID → new/existing role ID (for permission overwrite remapping)
-  const roleIdMap = new Map<string, string>();
-
-  const sortedRoles = [...snap.roles].sort((a, b) => a.position - b.position);
-
-  for (const roleSnap of sortedRoles) {
-    if (roleSnap.managed) continue;
-    const existing = guild.roles.cache.get(roleSnap.id) ?? guild.roles.cache.find(r => r.name === roleSnap.name);
-    if (existing) {
-      roleIdMap.set(roleSnap.id, existing.id);
-      continue;
-    }
-    try {
-      await delay(600);
-      const created = await guild.roles.create({
-        name: roleSnap.name,
-        color: roleSnap.color,
-        hoist: roleSnap.hoist,
-        mentionable: roleSnap.mentionable,
-        permissions: BigInt(roleSnap.permissions),
-        reason: "Anti-nuke: restoring deleted role",
-      });
-      roleIdMap.set(roleSnap.id, created.id);
-      logger.info({ guildId: guild.id, role: roleSnap.name }, "Role restored");
-    } catch (err: any) {
-      logger.error(`Failed to restore role "${roleSnap.name}": ${err?.message}`);
-    }
+  // ── Lock @everyone during restore so no one can interfere ────────────────
+  const everyoneRole = guild.roles.everyone;
+  const originalEveryonePerms = everyoneRole.permissions.bitfield;
+  const lockPerms = LOCKDOWN_DENY.reduce((acc, p) => acc | p, 0n);
+  const lockedPerms = originalEveryonePerms & ~lockPerms;
+  let lockApplied = false;
+  try {
+    await everyoneRole.setPermissions(lockedPerms, "Anti-nuke: locking server during restore");
+    lockApplied = true;
+    logger.info({ guildId: guild.id }, "Server locked during restore");
+  } catch (err: any) {
+    logger.warn(`Could not lock @everyone during restore: ${err?.message}`);
   }
 
-  // ── Restore channels ─────────────────────────────────────────────────────
-  // Helper: remap overwrite IDs (roles may have new IDs after recreation)
-  function remapOverwrites(overwrites: ChannelSnap["permissionOverwrites"]) {
-    return overwrites.map(ow => ({
-      id: ow.type === 0 ? (roleIdMap.get(ow.id) ?? ow.id) : ow.id,
-      type: ow.type as 0 | 1,
-      allow: BigInt(ow.allow),
-      deny: BigInt(ow.deny),
-    }));
-  }
+  try {
+    // ── Restore roles ──────────────────────────────────────────────────────
+    // Map: old role ID → live role ID (needed to remap permission overwrites)
+    const roleIdMap = new Map<string, string>();
+    const sortedRoles = [...snap.roles].sort((a, b) => a.position - b.position);
 
-  // Categories first, then everything else (sorted by position within each group)
-  const categories = snap.channels
-    .filter(c => c.type === ChannelType.GuildCategory)
-    .sort((a, b) => a.position - b.position);
-  const otherChannels = snap.channels
-    .filter(c => c.type !== ChannelType.GuildCategory)
-    .sort((a, b) => a.position - b.position);
-
-  // Map: old category ID → new/existing category ID
-  const categoryIdMap = new Map<string, string>();
-
-  for (const catSnap of categories) {
-    const existing = guild.channels.cache.get(catSnap.id) ?? guild.channels.cache.find(c => c.name === catSnap.name && c.type === ChannelType.GuildCategory);
-    if (existing) {
-      categoryIdMap.set(catSnap.id, existing.id);
-      continue;
-    }
-    try {
-      await delay(600);
-      const created = await guild.channels.create({
-        name: catSnap.name,
-        type: ChannelType.GuildCategory,
-        position: catSnap.position,
-        permissionOverwrites: remapOverwrites(catSnap.permissionOverwrites),
-        reason: "Anti-nuke: restoring deleted category",
-      });
-      categoryIdMap.set(catSnap.id, created.id);
-      logger.info({ guildId: guild.id, category: catSnap.name }, "Category restored");
-    } catch (err: any) {
-      logger.error(`Failed to restore category "${catSnap.name}": ${err?.message}`);
-    }
-  }
-
-  for (const chSnap of otherChannels) {
-    const existing = guild.channels.cache.get(chSnap.id);
-    if (existing) continue;
-
-    const resolvedParentId = chSnap.parentId ? (categoryIdMap.get(chSnap.parentId) ?? chSnap.parentId) : null;
-
-    try {
-      await delay(600);
-      if (chSnap.type === ChannelType.GuildText || chSnap.type === ChannelType.GuildAnnouncement) {
-        await guild.channels.create({
-          name: chSnap.name,
-          type: chSnap.type as ChannelType.GuildText | ChannelType.GuildAnnouncement,
-          parent: resolvedParentId ?? undefined,
-          position: chSnap.position,
-          topic: chSnap.topic ?? undefined,
-          nsfw: chSnap.nsfw,
-          rateLimitPerUser: chSnap.rateLimitPerUser,
-          permissionOverwrites: remapOverwrites(chSnap.permissionOverwrites),
-          reason: "Anti-nuke: restoring deleted channel",
-        });
-      } else if (chSnap.type === ChannelType.GuildVoice || chSnap.type === ChannelType.GuildStageVoice) {
-        await guild.channels.create({
-          name: chSnap.name,
-          type: chSnap.type as ChannelType.GuildVoice | ChannelType.GuildStageVoice,
-          parent: resolvedParentId ?? undefined,
-          position: chSnap.position,
-          bitrate: chSnap.bitrate ?? undefined,
-          userLimit: chSnap.userLimit ?? undefined,
-          permissionOverwrites: remapOverwrites(chSnap.permissionOverwrites),
-          reason: "Anti-nuke: restoring deleted channel",
-        });
-      } else if (chSnap.type === ChannelType.GuildForum) {
-        await guild.channels.create({
-          name: chSnap.name,
-          type: ChannelType.GuildForum,
-          parent: resolvedParentId ?? undefined,
-          position: chSnap.position,
-          permissionOverwrites: remapOverwrites(chSnap.permissionOverwrites),
-          reason: "Anti-nuke: restoring deleted channel",
-        });
+    for (const roleSnap of sortedRoles) {
+      if (roleSnap.managed) continue;
+      // Match by original ID first, then by exact name — never create a duplicate
+      const existing =
+        guild.roles.cache.get(roleSnap.id) ??
+        guild.roles.cache.find(r => r.name === roleSnap.name);
+      if (existing) {
+        roleIdMap.set(roleSnap.id, existing.id);
+        continue;
       }
-      logger.info({ guildId: guild.id, channel: chSnap.name, parent: resolvedParentId }, "Channel restored");
-    } catch (err: any) {
-      logger.error(`Failed to restore channel "${chSnap.name}": ${err?.message}`);
+      try {
+        await delay(600);
+        const created = await guild.roles.create({
+          name: roleSnap.name,
+          color: roleSnap.color,
+          hoist: roleSnap.hoist,
+          mentionable: roleSnap.mentionable,
+          permissions: BigInt(roleSnap.permissions),
+          reason: "Anti-nuke: restoring deleted role",
+        });
+        roleIdMap.set(roleSnap.id, created.id);
+        logger.info({ guildId: guild.id, role: roleSnap.name }, "Role restored");
+      } catch (err: any) {
+        logger.error(`Failed to restore role "${roleSnap.name}": ${err?.message}`);
+      }
+    }
+
+    // ── Restore channels ───────────────────────────────────────────────────
+    // Remap overwrite role IDs in case roles were recreated with new IDs
+    function remapOverwrites(overwrites: ChannelSnap["permissionOverwrites"]) {
+      return overwrites.map(ow => ({
+        id: ow.type === 0 ? (roleIdMap.get(ow.id) ?? ow.id) : ow.id,
+        type: ow.type as 0 | 1,
+        allow: BigInt(ow.allow),
+        deny: BigInt(ow.deny),
+      }));
+    }
+
+    // Categories first (sorted by position), then everything else
+    const categories = snap.channels
+      .filter(c => c.type === ChannelType.GuildCategory)
+      .sort((a, b) => a.position - b.position);
+    const otherChannels = snap.channels
+      .filter(c => c.type !== ChannelType.GuildCategory)
+      .sort((a, b) => a.position - b.position);
+
+    // Map: old category ID → live category ID
+    const categoryIdMap = new Map<string, string>();
+
+    for (const catSnap of categories) {
+      // Skip if already present by ID or by name (never duplicate)
+      const existing =
+        guild.channels.cache.get(catSnap.id) ??
+        guild.channels.cache.find(
+          c => c.name.toLowerCase() === catSnap.name.toLowerCase() &&
+               c.type === ChannelType.GuildCategory
+        );
+      if (existing) {
+        categoryIdMap.set(catSnap.id, existing.id);
+        continue;
+      }
+      try {
+        await delay(600);
+        const created = await guild.channels.create({
+          name: catSnap.name,
+          type: ChannelType.GuildCategory,
+          position: catSnap.position,
+          permissionOverwrites: remapOverwrites(catSnap.permissionOverwrites),
+          reason: "Anti-nuke: restoring deleted category",
+        });
+        categoryIdMap.set(catSnap.id, created.id);
+        logger.info({ guildId: guild.id, category: catSnap.name }, "Category restored");
+      } catch (err: any) {
+        logger.error(`Failed to restore category "${catSnap.name}": ${err?.message}`);
+      }
+    }
+
+    for (const chSnap of otherChannels) {
+      // Skip if already present by ID or by name+type in the same parent (never duplicate)
+      const resolvedParentId = chSnap.parentId
+        ? (categoryIdMap.get(chSnap.parentId) ?? chSnap.parentId)
+        : null;
+
+      const existing =
+        guild.channels.cache.get(chSnap.id) ??
+        guild.channels.cache.find(
+          c =>
+            c.name.toLowerCase() === chSnap.name.toLowerCase() &&
+            c.type === chSnap.type &&
+            (c as GuildChannel).parentId === resolvedParentId
+        );
+      if (existing) continue;
+
+      try {
+        await delay(600);
+        if (chSnap.type === ChannelType.GuildText || chSnap.type === ChannelType.GuildAnnouncement) {
+          await guild.channels.create({
+            name: chSnap.name,
+            type: chSnap.type as ChannelType.GuildText | ChannelType.GuildAnnouncement,
+            parent: resolvedParentId ?? undefined,
+            position: chSnap.position,
+            topic: chSnap.topic ?? undefined,
+            nsfw: chSnap.nsfw,
+            rateLimitPerUser: chSnap.rateLimitPerUser,
+            permissionOverwrites: remapOverwrites(chSnap.permissionOverwrites),
+            reason: "Anti-nuke: restoring deleted channel",
+          });
+        } else if (chSnap.type === ChannelType.GuildVoice || chSnap.type === ChannelType.GuildStageVoice) {
+          await guild.channels.create({
+            name: chSnap.name,
+            type: chSnap.type as ChannelType.GuildVoice | ChannelType.GuildStageVoice,
+            parent: resolvedParentId ?? undefined,
+            position: chSnap.position,
+            bitrate: chSnap.bitrate ?? undefined,
+            userLimit: chSnap.userLimit ?? undefined,
+            permissionOverwrites: remapOverwrites(chSnap.permissionOverwrites),
+            reason: "Anti-nuke: restoring deleted channel",
+          });
+        } else if (chSnap.type === ChannelType.GuildForum) {
+          await guild.channels.create({
+            name: chSnap.name,
+            type: ChannelType.GuildForum,
+            parent: resolvedParentId ?? undefined,
+            position: chSnap.position,
+            permissionOverwrites: remapOverwrites(chSnap.permissionOverwrites),
+            reason: "Anti-nuke: restoring deleted channel",
+          });
+        }
+        logger.info({ guildId: guild.id, channel: chSnap.name, parent: resolvedParentId }, "Channel restored");
+      } catch (err: any) {
+        logger.error(`Failed to restore channel "${chSnap.name}": ${err?.message}`);
+      }
+    }
+  } finally {
+    // ── Always unlock @everyone when done, even if restore partially failed ─
+    if (lockApplied) {
+      try {
+        await everyoneRole.setPermissions(originalEveryonePerms, "Anti-nuke: unlocking server after restore");
+        logger.info({ guildId: guild.id }, "Server unlocked after restore");
+      } catch (err: any) {
+        logger.warn(`Could not unlock @everyone after restore: ${err?.message}`);
+      }
     }
   }
 
   logger.info({ guildId: guild.id }, "Server restore complete");
 
   if (config.logChannelId) {
-    const logCh = guild.channels.cache.get(config.logChannelId) ?? categoryIdMap.get(config.logChannelId);
-    const ch = typeof logCh === "string" ? guild.channels.cache.get(logCh) : logCh;
+    const ch = guild.channels.cache.get(config.logChannelId);
     if (ch && "send" in ch) {
       await (ch as TextChannel).send({
         embeds: [
           new EmbedBuilder()
             .setColor(Colors.Green)
             .setTitle("Server Restored")
-            .setDescription("The anti-nuke system has restored channels and roles from the last snapshot.")
+            .setDescription("Channels and roles have been restored from the last snapshot.")
             .setFooter({ text: "Anti-Nuke System" })
             .setTimestamp(),
         ],
@@ -934,92 +986,51 @@ async function cmdHelp(message: Message): Promise<void> {
 }
 
 export async function showAntiNukeHelp(message: Message): Promise<void> {
-  const SEP = "▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬";
-
   const embed = new EmbedBuilder()
     .setColor(0x2B2D31)
-    .setAuthor({ name: "Anti-Nuke System  ·  Security Module" })
-    .setTitle("Command Reference")
+    .setTitle("Anti-Nuke — Commands")
     .setDescription(
-      "Protects your server against automated destruction attacks.\n" +
-      "All `-antinuke` commands require **Administrator** or server ownership.\n\n" +
-      "**Quick Setup**\n" +
-      "`-antinuke enable`  →  `-antinuke set logchannel #channel`  →  `-antinuke snapshot`  →  done."
+      "**Setup:** `-antinuke enable` → `-antinuke set logchannel #ch` → `-antinuke snapshot`\n" +
+      "All commands require **Administrator** or server ownership."
     )
     .addFields(
       {
-        name: "SYSTEM CONTROL",
+        name: "Control",
         value:
-          "`-antinuke enable`  —  Activate all active protections\n" +
-          "`-antinuke disable`  —  Deactivate the system (no actions taken)\n" +
-          "`-antinuke status`  —  View full configuration, thresholds, and snapshot age\n" +
-          "`-antinuke reset`  —  Restore every setting to factory defaults",
+          "`-antinuke enable` / `disable` / `status` / `reset`",
+        inline: false,
       },
-      { name: SEP, value: "\u200b" },
       {
-        name: "SNAPSHOT & RESTORE",
+        name: "Snapshot & Restore",
         value:
-          "`-antinuke snapshot`  —  Save the current server layout (channels, categories, roles, permissions)\n" +
-          "  Snapshots are also taken automatically every 5 minutes while the bot is online.\n\n" +
-          "`-antinuke restore`  —  Manually restore deleted channels and roles from the last snapshot\n" +
-          "  The system also restores automatically when a mass channel or role delete is detected.",
+          "`-antinuke snapshot` — save server layout (auto every 5 min)\n" +
+          "`-antinuke restore` — rebuild missing channels/roles from snapshot",
+        inline: false,
       },
-      { name: SEP, value: "\u200b" },
       {
-        name: "CONFIGURATION",
+        name: "Settings",
         value:
           "`-antinuke set punishment <ban|kick|strip>`\n" +
-          "  Determines what happens to the attacker when a threshold is hit.\n" +
-          "  `ban` — permanently removes them  |  `kick` — removes from server\n" +
-          "  `strip` — revokes all elevated roles\n\n" +
           "`-antinuke set logchannel #channel`\n" +
-          "  Channel where security alert embeds are sent on each violation.\n\n" +
-          "`-antinuke set window <ms>`\n" +
-          "  Rate-tracking window in milliseconds. Default: `10000` (10 seconds).\n" +
-          "  Range: 3000 – 60000.\n\n" +
-          "`-antinuke set threshold <action> <number>`\n" +
-          "  How many of a given action within the window triggers a response.",
+          "`-antinuke set window <ms>` — default 10000 (10s)\n" +
+          "`-antinuke set threshold <action> <n>`",
+        inline: false,
       },
-      { name: SEP, value: "\u200b" },
       {
-        name: "THRESHOLD ACTIONS",
+        name: "Threshold actions",
         value:
-          "Use these with `-antinuke set threshold <action> <n>`:\n\n" +
-          "`ban`            — mass bans  *(default: 3)*\n" +
-          "`kick`           — mass kicks  *(default: 5)*\n" +
-          "`channelcreate`  — channel creation spam  *(default: 5)*\n" +
-          "`channeldelete`  — mass channel deletion  *(default: 3)*\n" +
-          "`channelrename`  — mass channel renames  *(default: 5)*\n" +
-          "`roledelete`     — mass role deletion  *(default: 3)*\n" +
-          "`rolecreate`     — mass role creation  *(default: 5)*\n" +
-          "`mention`        — mass mentions / @everyone  *(default: 10)*\n" +
-          "`link`           — link spam  *(default: 5)*\n" +
-          "`webhook`        — webhook creation spam  *(default: 2)*",
+          "`ban` · `kick` · `channelcreate` · `channeldelete` · `channelrename`\n" +
+          "`roledelete` · `rolecreate` · `mention` · `link` · `webhook`",
+        inline: false,
       },
-      { name: SEP, value: "\u200b" },
       {
-        name: "WHITELIST",
+        name: "Whitelist",
         value:
-          "Whitelisted users are fully exempt from all detection.\n" +
-          "Add your most trusted admins and bots here.\n\n" +
-          "`-antinuke whitelist add @user`  —  Exempt a user\n" +
-          "`-antinuke whitelist remove @user`  —  Revoke exemption\n" +
-          "`-antinuke whitelist list`  —  View all exempted users",
-      },
-      { name: SEP, value: "\u200b" },
-      {
-        name: "PROTECTIONS OVERVIEW",
-        value:
-          "The following actions are monitored in real time:\n\n" +
-          "Mass Ban  ·  Mass Kick  ·  Mass Channel Create\n" +
-          "Mass Channel Delete  ·  Mass Channel Rename\n" +
-          "Mass Role Create  ·  Mass Role Delete  ·  Mass Role Grant\n" +
-          "Webhook Creation Spam  ·  Link Spam  ·  Mass Mention / @everyone\n\n" +
-          "Server owner and bots are always skipped. Bot role hierarchy is respected.\n" +
-          "Rate tracking uses a **sliding window** — async/delayed burst attacks are fully detected.",
+          "`-antinuke whitelist add/remove @user` · `list`",
+        inline: false,
       },
     )
-    .setFooter({ text: "-help  ·  Anti-Nuke System  ·  All times in UTC" })
+    .setFooter({ text: "Anti-Nuke System" })
     .setTimestamp();
 
   await message.reply({ embeds: [embed] });
