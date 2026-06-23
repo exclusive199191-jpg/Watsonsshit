@@ -816,6 +816,12 @@ type PunishResult =
   | "not_found"
   | "hierarchy_error";
 
+// Destructive actions that warrant an IMMEDIATE permanent ban — no kick/escalation.
+// A bot that mass-deletes channels gets one chance: a ban. No re-invite path.
+const IMMEDIATE_BAN_ACTIONS = new Set([
+  "chDelete", "roleDelete", "ban", "botAdd", "guildUpdate",
+]);
+
 // No ELEVATED subset — on first offense we strip ALL non-@everyone roles.
 // Bots are NOT skipped: they receive the same punishment as human accounts.
 
@@ -824,6 +830,7 @@ async function executePunishment(
   executorId: string,
   _config: AntiNukeConfig,
   reason: string,
+  forceBan = false,
 ): Promise<PunishResult> {
   // Discord API does not allow banning/kicking the server owner — skip only the owner.
   if (executorId === guild.ownerId) return "skipped_owner";
@@ -843,8 +850,7 @@ async function executePunishment(
   const hierarchyBlocked = botMember && member.roles.highest.comparePositionTo(botMember.roles.highest) >= 0;
 
   if (hierarchyBlocked) {
-    // Try stripping roles individually regardless — still attempt even if top role is above us.
-    // Then return hierarchy_error so the log shows the issue.
+    // Still try stripping roles even if hierarchy is a problem.
     try {
       const roleIds = member.roles.cache.filter(r => r.id !== guild.id).map(r => r.id);
       if (roleIds.length > 0) await member.roles.remove(roleIds, reason).catch(() => null);
@@ -852,24 +858,35 @@ async function executePunishment(
     return "hierarchy_error";
   }
 
-  if (offenseCount >= 2) {
-    // Repeat offender — permanent ban regardless of bot/human status.
+  // Destructive first-offense OR repeat offender → permanent ban immediately.
+  if (forceBan || offenseCount >= 2) {
+    // Strip roles first so the ban takes effect cleanly.
+    const allRoles = member.roles.cache.filter(r => r.id !== guild.id);
+    if (allRoles.size > 0) {
+      await member.roles.remove(allRoles, reason + " [role strip before ban]").catch(() => null);
+    }
     await guild.bans.create(executorId, {
       deleteMessageSeconds: 86400,
-      reason: reason + " [REPEAT OFFENSE — permanent ban]",
+      reason: reason + (offenseCount >= 2 ? " [REPEAT OFFENSE — permanent ban]" : " [destructive action — immediate ban]"),
     }).catch(() => null);
-    logger.warn(`Anti-nuke: REPEAT BAN — ${executorId} in guild ${guild.id} (offense #${offenseCount})`);
-    return "banned_repeat";
+    // For bots: also revoke OAuth2 integration so the invite token is invalidated.
+    if (member.user.bot) {
+      await (guild.client.rest as any)
+        .delete(`/guilds/${guild.id}/integrations/${executorId}`)
+        .catch(() => null);
+    }
+    logger.warn(`Anti-nuke: BAN — ${executorId} in guild ${guild.id} (offense #${offenseCount}, forceBan=${forceBan})`);
+    return offenseCount >= 2 ? "banned_repeat" : "banned";
   }
 
-  // First offense: strip ALL roles then kick — bots included, no exceptions.
+  // Non-destructive first offense: strip ALL roles then kick.
   const allRoles = member.roles.cache.filter(r => r.id !== guild.id);
   if (allRoles.size > 0) {
     await member.roles.remove(allRoles, reason + " [role strip — pre-kick]").catch(() => null);
   }
   await member.kick(reason).catch(() => null);
 
-  // For bots: also try to revoke their OAuth2 integration so the invite can't re-authorize.
+  // For bots: also revoke OAuth2 so the invite can't re-authorize.
   if (member.user.bot) {
     await (guild.client.rest as any)
       .delete(`/guilds/${guild.id}/integrations/${executorId}`)
@@ -892,7 +909,9 @@ const PUNISH_LABEL: Record<PunishResult, string> = {
 
 let _client: Client | null = null;
 
-// (All violations now trigger emergency restore — no per-action filter needed)
+// Per-guild restore lock — prevents simultaneous restores from racing each other.
+// Key = guildId, Value = true while a restore/cleanup is in flight.
+const restoreInProgress = new Map<string, boolean>();
 
 async function handleViolation(
   guild: Guild,
@@ -905,11 +924,16 @@ async function handleViolation(
 ): Promise<void> {
   resetRate(guild.id, executor.id, actionKey);
 
+  // Destructive actions (channel/role delete, mass ban, bot add, server update)
+  // get an immediate permanent ban — no kick-first escalation, no second chance.
+  const forceBan = IMMEDIATE_BAN_ACTIONS.has(actionKey);
+
   const executorLabel = (executor as User).tag ?? (executor as PartialUser).username ?? executor.id;
   const reason = `Anti-Nuke: ${violationLabel} — ${count} actions in ${config.timeWindowMs / 1000}s (limit: ${threshold})`;
   let result: PunishResult = "hierarchy_error";
   try {
-    result = await executePunishment(guild, executor.id, config, reason);
+    // ── PUNISHMENT FIRST — ban the attacker before anything else runs ──────
+    result = await executePunishment(guild, executor.id, config, reason, forceBan);
   } catch (err: any) {
     logger.error(`Anti-nuke punishment error: ${err?.message}`);
   }
@@ -953,11 +977,16 @@ async function handleViolation(
     }
   }
 
-  // Immediate emergency restore for ANY violation — wipes attacker's created junk
-  // and rebuilds anything they deleted. Never wait for the 5-min snapshot cron.
-  triggerEmergencyRestore(guild, executor.id).catch((err: any) => {
-    logger.error(`Emergency restore error for guild ${guild.id}: ${err?.message}`);
-  });
+  // Immediate emergency restore — runs AFTER the ban is confirmed.
+  // The restore lock prevents parallel restores from racing each other.
+  if (!restoreInProgress.get(guild.id)) {
+    restoreInProgress.set(guild.id, true);
+    triggerEmergencyRestore(guild, executor.id)
+      .catch((err: any) => logger.error(`Emergency restore error for guild ${guild.id}: ${err?.message}`))
+      .finally(() => restoreInProgress.delete(guild.id));
+  } else {
+    logger.info({ guildId: guild.id }, "Emergency restore already in progress — skipping duplicate trigger");
+  }
 }
 
 // ── Audit log event handler ──────────────────────────────────────────────────
