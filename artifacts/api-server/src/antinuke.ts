@@ -18,8 +18,13 @@ import {
   type PermissionOverwrites,
 } from "discord.js";
 import { db } from "@workspace/db";
-import { antinukeConfigTable, guildSnapshotTable } from "@workspace/db";
-import { eq } from "drizzle-orm";
+import {
+  antinukeConfigTable,
+  guildSnapshotTable,
+  guildSnapshotHistoryTable,
+  antinukeOffensesTable,
+} from "@workspace/db";
+import { eq, desc, sql, and } from "drizzle-orm";
 import { logger } from "./lib/logger";
 
 type AnyUser = User | PartialUser;
@@ -180,6 +185,30 @@ async function getConfig(guildId: string): Promise<AntiNukeConfig | null> {
   return config;
 }
 
+// ── Persistent offense counter ────────────────────────────────────────────────
+// Returns the NEW offense count after incrementing. Persisted to DB so it
+// survives restarts — first offense → kick+strip, repeat → permanent ban.
+
+async function getAndIncrementOffense(guildId: string, userId: string): Promise<number> {
+  if (!db) return 1;
+  try {
+    const rows = await db
+      .insert(antinukeOffensesTable)
+      .values({ guildId, userId, offenseCount: 1, lastOffenseAt: new Date() })
+      .onConflictDoUpdate({
+        target: [antinukeOffensesTable.guildId, antinukeOffensesTable.userId],
+        set: {
+          offenseCount: sql`antinuke_offenses.offense_count + 1`,
+          lastOffenseAt: new Date(),
+        },
+      })
+      .returning({ offenseCount: antinukeOffensesTable.offenseCount });
+    return rows[0]?.offenseCount ?? 1;
+  } catch {
+    return 1;
+  }
+}
+
 type ConfigPatch = Partial<Omit<typeof antinukeConfigTable.$inferInsert, "guildId">>;
 
 async function upsertConfig(guildId: string, patch: ConfigPatch): Promise<void> {
@@ -279,23 +308,45 @@ export async function takeSnapshot(guild: Guild): Promise<void> {
       });
     }
 
+    const channelsJson = JSON.stringify(channels);
+    const rolesJson = JSON.stringify(roles);
+    const now = new Date();
+
+    // Write to history table (keeps last 3 complete snapshots per guild)
+    await db.insert(guildSnapshotHistoryTable).values({
+      guildId: guild.id,
+      guildName: guild.name,
+      channelsJson,
+      rolesJson,
+      takenAt: now,
+      isComplete: true,
+    });
+
+    // Prune: keep only the 3 most recent complete snapshots
+    const recent = await db
+      .select({ id: guildSnapshotHistoryTable.id })
+      .from(guildSnapshotHistoryTable)
+      .where(and(
+        eq(guildSnapshotHistoryTable.guildId, guild.id),
+        eq(guildSnapshotHistoryTable.isComplete, true),
+      ))
+      .orderBy(desc(guildSnapshotHistoryTable.takenAt));
+
+    if (recent.length > 3) {
+      for (const old of recent.slice(3)) {
+        await db.delete(guildSnapshotHistoryTable)
+          .where(eq(guildSnapshotHistoryTable.id, old.id))
+          .catch(() => null);
+      }
+    }
+
+    // Also keep the legacy single-row table updated (backward compat)
     await db
       .insert(guildSnapshotTable)
-      .values({
-        guildId: guild.id,
-        guildName: guild.name,
-        channelsJson: JSON.stringify(channels),
-        rolesJson: JSON.stringify(roles),
-        takenAt: new Date(),
-      })
+      .values({ guildId: guild.id, guildName: guild.name, channelsJson, rolesJson, takenAt: now })
       .onConflictDoUpdate({
         target: guildSnapshotTable.guildId,
-        set: {
-          guildName: guild.name,
-          channelsJson: JSON.stringify(channels),
-          rolesJson: JSON.stringify(roles),
-          takenAt: new Date(),
-        },
+        set: { guildName: guild.name, channelsJson, rolesJson, takenAt: now },
       });
 
     logger.info({ guildId: guild.id, channels: channels.length, roles: roles.length }, "Guild snapshot saved");
@@ -304,18 +355,49 @@ export async function takeSnapshot(guild: Guild): Promise<void> {
   }
 }
 
-async function loadSnapshot(guildId: string): Promise<{ channels: ChannelSnap[]; roles: RoleSnap[] } | null> {
+// Loads the best available snapshot from history, falling back through up to 3.
+// Returns the snapshot data AND the timestamp so callers can report which one was used.
+async function loadSnapshot(guildId: string): Promise<{
+  channels: ChannelSnap[];
+  roles: RoleSnap[];
+  takenAt: Date;
+} | null> {
   if (!db) return null;
-  const rows = await db.select().from(guildSnapshotTable).where(eq(guildSnapshotTable.guildId, guildId)).limit(1);
+
+  // Try history table first (newest→oldest, up to 3)
+  const history = await db
+    .select()
+    .from(guildSnapshotHistoryTable)
+    .where(and(
+      eq(guildSnapshotHistoryTable.guildId, guildId),
+      eq(guildSnapshotHistoryTable.isComplete, true),
+    ))
+    .orderBy(desc(guildSnapshotHistoryTable.takenAt))
+    .limit(3)
+    .catch(() => [] as typeof guildSnapshotHistoryTable.$inferSelect[]);
+
+  for (const row of history) {
+    try {
+      const channels: ChannelSnap[] = JSON.parse(row.channelsJson);
+      const roles: RoleSnap[] = JSON.parse(row.rolesJson);
+      if (Array.isArray(channels) && Array.isArray(roles)) {
+        return { channels, roles, takenAt: new Date(row.takenAt) };
+      }
+    } catch { /* try next */ }
+  }
+
+  // Fall back to legacy single-row table
+  const rows = await db.select().from(guildSnapshotTable).where(eq(guildSnapshotTable.guildId, guildId)).limit(1).catch(() => []);
   if (rows.length === 0) return null;
   try {
-    return {
-      channels: JSON.parse(rows[0].channelsJson),
-      roles: JSON.parse(rows[0].rolesJson),
-    };
-  } catch {
-    return null;
-  }
+    const channels: ChannelSnap[] = JSON.parse(rows[0].channelsJson);
+    const roles: RoleSnap[] = JSON.parse(rows[0].rolesJson);
+    if (Array.isArray(channels) && Array.isArray(roles)) {
+      return { channels, roles, takenAt: new Date(rows[0].takenAt) };
+    }
+  } catch { /* nothing */ }
+
+  return null;
 }
 
 function delay(ms: number): Promise<void> {
@@ -334,12 +416,33 @@ const LOCKDOWN_DENY = [
   PermissionsBitField.Flags.ManageWebhooks,
 ];
 
-async function restoreFromSnapshot(guild: Guild, config: AntiNukeConfig): Promise<void> {
+interface RestoreStats {
+  rolesCreated: number;
+  rolesSkipped: number;
+  channelsCreated: number;
+  channelsSkipped: number;
+  overwritesReapplied: number;
+  snapshotTimestamp: Date;
+  timeTakenMs: number;
+}
+
+async function restoreFromSnapshot(guild: Guild, config: AntiNukeConfig): Promise<RestoreStats> {
+  const startMs = Date.now();
   const snap = await loadSnapshot(guild.id);
   if (!snap) {
     logger.warn(`No snapshot found for guild ${guild.id} — cannot restore`);
-    return;
+    return { rolesCreated: 0, rolesSkipped: 0, channelsCreated: 0, channelsSkipped: 0, overwritesReapplied: 0, snapshotTimestamp: new Date(), timeTakenMs: 0 };
   }
+
+  const stats: RestoreStats = {
+    rolesCreated: 0,
+    rolesSkipped: 0,
+    channelsCreated: 0,
+    channelsSkipped: 0,
+    overwritesReapplied: 0,
+    snapshotTimestamp: snap.takenAt,
+    timeTakenMs: 0,
+  };
 
   logger.info({ guildId: guild.id }, "Starting server restore from snapshot");
 
@@ -376,6 +479,7 @@ async function restoreFromSnapshot(guild: Guild, config: AntiNukeConfig): Promis
 
       if (existing) {
         roleIdMap.set(roleSnap.id, existing.id);
+        stats.rolesSkipped++;
         // Repair the role if it was modified (wrong permissions / colour)
         try {
           await existing.edit({
@@ -400,6 +504,7 @@ async function restoreFromSnapshot(guild: Guild, config: AntiNukeConfig): Promis
           reason: "Anti-nuke: restoring deleted role",
         });
         roleIdMap.set(roleSnap.id, created.id);
+        stats.rolesCreated++;
         logger.info({ guildId: guild.id, role: roleSnap.name }, "Role restored");
       } catch (err: any) {
         logger.error(`Failed to restore role "${roleSnap.name}": ${err?.message}`);
@@ -443,6 +548,7 @@ async function restoreFromSnapshot(guild: Guild, config: AntiNukeConfig): Promis
 
       if (existing) {
         categoryIdMap.set(catSnap.id, existing.id);
+        stats.channelsSkipped++;
         // Repair name if it was changed
         if (existing.name !== catSnap.name) {
           await existing.setName(catSnap.name, "Anti-nuke: restoring category name").catch(() => null);
@@ -458,6 +564,7 @@ async function restoreFromSnapshot(guild: Guild, config: AntiNukeConfig): Promis
           reason: "Anti-nuke: restoring deleted category",
         });
         categoryIdMap.set(catSnap.id, created.id);
+        stats.channelsCreated++;
         logger.info({ guildId: guild.id, category: catSnap.name }, "Category restored");
       } catch (err: any) {
         logger.error(`Failed to restore category "${catSnap.name}": ${err?.message}`);
@@ -500,6 +607,15 @@ async function restoreFromSnapshot(guild: Guild, config: AntiNukeConfig): Promis
             reason: "Anti-nuke: repairing channel drift",
           }).catch(() => null);
         }
+        // Reapply permission overwrites
+        try {
+          const remapped = remapOverwrites(chSnap.permissionOverwrites);
+          if (remapped.length > 0) {
+            await gc.permissionOverwrites.set(remapped, "Anti-nuke: reapplying overwrites").catch(() => null);
+            stats.overwritesReapplied++;
+          }
+        } catch { /* best-effort */ }
+        stats.channelsSkipped++;
         continue;
       }
 
@@ -535,6 +651,7 @@ async function restoreFromSnapshot(guild: Guild, config: AntiNukeConfig): Promis
             reason: "Anti-nuke: restoring deleted channel",
           });
         }
+        stats.channelsCreated++;
         logger.info({ guildId: guild.id, channel: chSnap.name, parent: resolvedParentId }, "Channel restored");
       } catch (err: any) {
         logger.error(`Failed to restore channel "${chSnap.name}": ${err?.message}`);
@@ -591,7 +708,8 @@ async function restoreFromSnapshot(guild: Guild, config: AntiNukeConfig): Promis
     }
   }
 
-  logger.info({ guildId: guild.id }, "Server restore complete");
+  stats.timeTakenMs = Date.now() - startMs;
+  logger.info({ guildId: guild.id, ...stats }, "Server restore complete");
 
   if (config.logChannelId) {
     const ch = guild.channels.cache.get(config.logChannelId);
@@ -601,85 +719,146 @@ async function restoreFromSnapshot(guild: Guild, config: AntiNukeConfig): Promis
           new EmbedBuilder()
             .setColor(Colors.Green)
             .setTitle("Server Restored")
-            .setDescription("Channels and roles have been restored from the last snapshot.")
+            .setDescription(
+              `Channels and roles have been restored from snapshot taken <t:${Math.floor(stats.snapshotTimestamp.getTime() / 1000)}:R>.\n\n` +
+              `📁 **Channels created:** ${stats.channelsCreated}  |  skipped: ${stats.channelsSkipped}\n` +
+              `🔑 **Roles created:** ${stats.rolesCreated}  |  skipped: ${stats.rolesSkipped}\n` +
+              `🔒 **Overwrites reapplied:** ${stats.overwritesReapplied}\n` +
+              `⏱ Time taken: ${(stats.timeTakenMs / 1000).toFixed(1)}s`
+            )
             .setFooter({ text: "Anti-Nuke System" })
             .setTimestamp(),
         ],
       }).catch(() => null);
     }
   }
+
+  return stats;
+}
+
+// ── Emergency restore (called immediately on violation, no cron dependency) ──
+
+async function triggerEmergencyRestore(guild: Guild, attackerId: string, attackWindowMs: number): Promise<void> {
+  const config = await getConfig(guild.id);
+  if (!config) return;
+
+  // First: clean up channels/roles that the attacker created during the attack window
+  // (only delete entities whose audit-log creator is the attacker within the attack time)
+  try {
+    const attackWindowStart = Date.now() - attackWindowMs;
+    // Fetch recent audit log entries for channel/role creates
+    const auditLogs = await guild.fetchAuditLogs({ limit: 25 }).catch(() => null);
+    if (auditLogs) {
+      for (const entry of auditLogs.entries.values()) {
+        if (entry.executor?.id !== attackerId) continue;
+        if (entry.createdTimestamp < attackWindowStart) continue;
+
+        const { AuditLogEvent: ALE } = await import("discord.js");
+        if (entry.action === ALE.ChannelCreate) {
+          const targetId = (entry.target as { id?: string } | null)?.id;
+          if (targetId) {
+            const ch = guild.channels.cache.get(targetId);
+            if (ch) await ch.delete("Anti-nuke: removing attacker-created channel").catch(() => null);
+          }
+        } else if (entry.action === ALE.RoleCreate) {
+          const targetId = (entry.target as { id?: string } | null)?.id;
+          if (targetId) {
+            const role = guild.roles.cache.get(targetId);
+            if (role && !role.managed) await role.delete("Anti-nuke: removing attacker-created role").catch(() => null);
+          }
+        }
+      }
+    }
+  } catch (err: any) {
+    logger.warn(`Attacker cleanup error: ${err?.message}`);
+  }
+
+  // Then: restore from snapshot (recreates deleted channels/roles)
+  restoreFromSnapshot(guild, config).catch((err: any) => {
+    logger.error(`Emergency restore error for guild ${guild.id}: ${err?.message}`);
+  });
 }
 
 // ── Punishment engine ────────────────────────────────────────────────────────
 
 type PunishResult =
   | "banned"
-  | "kicked"
-  | "stripped"
+  | "banned_repeat"
+  | "kicked_and_stripped"
   | "skipped_owner"
-  | "skipped_bot"
   | "not_found"
   | "hierarchy_error";
 
-const ELEVATED = [
-  PermissionsBitField.Flags.Administrator,
-  PermissionsBitField.Flags.BanMembers,
-  PermissionsBitField.Flags.KickMembers,
-  PermissionsBitField.Flags.ManageChannels,
-  PermissionsBitField.Flags.ManageRoles,
-  PermissionsBitField.Flags.ManageGuild,
-];
+// No ELEVATED subset — on first offense we strip ALL non-@everyone roles.
+// Bots are NOT skipped: they receive the same punishment as human accounts.
 
 async function executePunishment(
   guild: Guild,
   executorId: string,
-  config: AntiNukeConfig,
+  _config: AntiNukeConfig,
   reason: string,
 ): Promise<PunishResult> {
+  // Discord API does not allow banning/kicking the server owner — skip only the owner.
   if (executorId === guild.ownerId) return "skipped_owner";
+
+  // Increment DB offense counter — determines kick vs ban escalation.
+  const offenseCount = await getAndIncrementOffense(guild.id, executorId);
 
   const member = await guild.members.fetch(executorId).catch(() => null);
 
   if (!member) {
-    if (config.punishment === "ban") {
-      await guild.bans.create(executorId, { reason }).catch(() => null);
-      return "banned";
-    }
-    return "not_found";
+    // Not in the server — create a ban record so they can't rejoin.
+    await guild.bans.create(executorId, { reason: reason + " [not in server — preemptive ban]" }).catch(() => null);
+    return "banned";
   }
 
-  if (member.user.bot) return "skipped_bot";
-
   const botMember = guild.members.me;
-  if (botMember && member.roles.highest.comparePositionTo(botMember.roles.highest) >= 0) {
+  const hierarchyBlocked = botMember && member.roles.highest.comparePositionTo(botMember.roles.highest) >= 0;
+
+  if (hierarchyBlocked) {
+    // Try stripping roles individually regardless — still attempt even if top role is above us.
+    // Then return hierarchy_error so the log shows the issue.
+    try {
+      const roleIds = member.roles.cache.filter(r => r.id !== guild.id).map(r => r.id);
+      if (roleIds.length > 0) await member.roles.remove(roleIds, reason).catch(() => null);
+    } catch { /* best-effort */ }
     return "hierarchy_error";
   }
 
-  switch (config.punishment) {
-    case "ban":
-      await guild.bans.create(executorId, { reason });
-      return "banned";
-    case "kick":
-      await member.kick(reason);
-      return "kicked";
-    case "strip": {
-      const adminRoles = member.roles.cache.filter(r => ELEVATED.some(p => r.permissions.has(p)));
-      if (adminRoles.size > 0) await member.roles.remove(adminRoles, reason);
-      return "stripped";
-    }
-    default:
-      return "hierarchy_error";
+  if (offenseCount >= 2) {
+    // Repeat offender — permanent ban regardless of bot/human status.
+    await guild.bans.create(executorId, {
+      deleteMessageSeconds: 86400,
+      reason: reason + " [REPEAT OFFENSE — permanent ban]",
+    }).catch(() => null);
+    logger.warn(`Anti-nuke: REPEAT BAN — ${executorId} in guild ${guild.id} (offense #${offenseCount})`);
+    return "banned_repeat";
   }
+
+  // First offense: strip ALL roles then kick — bots included, no exceptions.
+  const allRoles = member.roles.cache.filter(r => r.id !== guild.id);
+  if (allRoles.size > 0) {
+    await member.roles.remove(allRoles, reason + " [role strip — pre-kick]").catch(() => null);
+  }
+  await member.kick(reason).catch(() => null);
+
+  // For bots: also try to revoke their OAuth2 integration so the invite can't re-authorize.
+  if (member.user.bot) {
+    await (guild.client.rest as any)
+      .delete(`/guilds/${guild.id}/integrations/${executorId}`)
+      .catch(() => null);
+  }
+
+  return "kicked_and_stripped";
 }
 
 const PUNISH_LABEL: Record<PunishResult, string> = {
-  banned:          "User banned from the server",
-  kicked:          "User kicked from the server",
-  stripped:        "Elevated roles removed",
-  skipped_owner:   "No action — user is the server owner",
-  skipped_bot:     "No action — user is a bot",
-  not_found:       "User not in server — ban record created",
-  hierarchy_error: "No action — bot role is below this user's highest role",
+  banned:              "User not in server — ban record created",
+  banned_repeat:       "⛔ REPEAT OFFENDER — permanently banned",
+  kicked_and_stripped: "Kicked + all roles stripped (first offense)",
+  skipped_owner:       "No action — user is the server owner",
+  not_found:           "User not found",
+  hierarchy_error:     "Hierarchy blocked — roles stripped where possible",
 };
 
 // ── Violation handler ────────────────────────────────────────────────────────
@@ -748,10 +927,10 @@ async function handleViolation(
     }
   }
 
-  // Auto-restore channels/roles when a destructive nuke is detected
+  // Immediate emergency restore for destructive actions — no cron delay
   if (RESTORE_TRIGGERS.has(actionKey)) {
-    restoreFromSnapshot(guild, config).catch((err: any) => {
-      logger.error(`Restore error for guild ${guild.id}: ${err?.message}`);
+    triggerEmergencyRestore(guild, executor.id, config.timeWindowMs).catch((err: any) => {
+      logger.error(`Emergency restore error for guild ${guild.id}: ${err?.message}`);
     });
   }
 }
@@ -1304,6 +1483,12 @@ async function cmdSnapshot(message: Message): Promise<void> {
 async function cmdRestore(message: Message): Promise<void> {
   if (!message.guild) return;
   if (!db) { await message.reply({ embeds: [errEmbed("Database not configured.")] }); return; }
+
+  if (!isAdmin(message)) {
+    await message.reply({ embeds: [errEmbed("Only the server owner or an Administrator can run this command.")] });
+    return;
+  }
+
   const snap = await loadSnapshot(message.guild.id);
   if (!snap) {
     await message.reply({ embeds: [errEmbed("No snapshot found. Run `-antinuke snapshot` first.")] });
@@ -1314,14 +1499,98 @@ async function cmdRestore(message: Message): Promise<void> {
     await message.reply({ embeds: [errEmbed("Anti-nuke is not configured. Run `-antinuke enable` first.")] });
     return;
   }
-  await message.reply({ embeds: [infoEmbed(
-    "Restore Started",
-    `Restoring **${snap.channels.length}** channels and **${snap.roles.length}** roles from the last snapshot.\n` +
-    "This may take a minute. Categories are restored first, then channels within them."
-  )] });
-  restoreFromSnapshot(message.guild, config).catch((err: any) => {
-    logger.error(`Manual restore error: ${err?.message}`);
+
+  const guild = message.guild;
+  await guild.channels.fetch();
+  await guild.roles.fetch();
+
+  // Dry-run preview: count what would be created vs already present
+  let channelsToCreate = 0;
+  let channelsPresent = 0;
+  let rolesToCreate = 0;
+  let rolesPresent = 0;
+
+  for (const roleSnap of snap.roles) {
+    if (roleSnap.managed) continue;
+    const exists = guild.roles.cache.get(roleSnap.id) ?? guild.roles.cache.find(r => r.name === roleSnap.name && !r.managed);
+    if (exists) rolesPresent++; else rolesToCreate++;
+  }
+
+  for (const chSnap of snap.channels) {
+    const exists = guild.channels.cache.get(chSnap.id) ??
+      guild.channels.cache.find(c =>
+        c.name.toLowerCase() === chSnap.name.toLowerCase() && c.type === chSnap.type
+      );
+    if (exists) channelsPresent++; else channelsToCreate++;
+  }
+
+  const snapTs = `<t:${Math.floor(snap.takenAt.getTime() / 1000)}:F>`;
+
+  // Send confirmation embed and wait for ✅ reaction from the command author
+  const confirmMsg = await message.reply({
+    embeds: [
+      new EmbedBuilder()
+        .setColor(Colors.Yellow)
+        .setTitle("⚠️ Restore Confirmation Required")
+        .setDescription(
+          `This will restore the server to the snapshot taken **${snapTs}**.\n\n` +
+          `**Preview (dry-run):**\n` +
+          `📁 Channels to create: **${channelsToCreate}**  ·  already present: **${channelsPresent}**\n` +
+          `🔑 Roles to create: **${rolesToCreate}**  ·  already present: **${rolesPresent}**\n\n` +
+          `React with ✅ within **30 seconds** to confirm, or ❌ to cancel.`
+        )
+        .setFooter({ text: "Anti-Nuke System  ·  Manual Restore" })
+        .setTimestamp(),
+    ],
   });
+
+  await confirmMsg.react("✅").catch(() => null);
+  await confirmMsg.react("❌").catch(() => null);
+
+  let confirmed = false;
+  try {
+    const collected = await confirmMsg.awaitReactions({
+      filter: (r, u) => ["✅", "❌"].includes(r.emoji.name ?? "") && u.id === message.author.id,
+      max: 1,
+      time: 30_000,
+      errors: ["time"],
+    });
+    confirmed = collected.first()?.emoji.name === "✅";
+  } catch {
+    confirmed = false;
+  }
+
+  if (!confirmed) {
+    await confirmMsg.edit({ embeds: [infoEmbed("Restore Cancelled", "No confirmation received — restore aborted.")] }).catch(() => null);
+    return;
+  }
+
+  const pending = await message.reply({ embeds: [infoEmbed(
+    "Restore In Progress…",
+    `Restoring **${snap.channels.length}** channels and **${snap.roles.length}** roles from snapshot.\n` +
+    "Categories → channels → permission overwrites. This may take a minute."
+  )] });
+
+  try {
+    const stats = await restoreFromSnapshot(guild, config);
+    await pending.edit({ embeds: [
+      new EmbedBuilder()
+        .setColor(Colors.Green)
+        .setTitle("✅ Restore Complete")
+        .setDescription(
+          `Restored from snapshot taken ${snapTs}.\n\n` +
+          `📁 **Channels created:** ${stats.channelsCreated}  |  skipped (already existed): ${stats.channelsSkipped}\n` +
+          `🔑 **Roles created:** ${stats.rolesCreated}  |  skipped (already existed): ${stats.rolesSkipped}\n` +
+          `🔒 **Permission overwrites reapplied:** ${stats.overwritesReapplied}\n` +
+          `⏱ **Time taken:** ${(stats.timeTakenMs / 1000).toFixed(1)}s`
+        )
+        .setFooter({ text: "Anti-Nuke System" })
+        .setTimestamp(),
+    ] });
+  } catch (err: any) {
+    logger.error(`Manual restore error: ${err?.message}`);
+    await pending.edit({ embeds: [errEmbed(`Restore encountered an error: ${err?.message}`)] }).catch(() => null);
+  }
 }
 
 // ── Toggle command ───────────────────────────────────────────────────────────

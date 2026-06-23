@@ -1,0 +1,33 @@
+Upgrade the anti-nuke bot’s detection-to-response pipeline and fix the restore system. Implement these exact behaviors in artifacts/api-server/src/antinuke.ts (and any other files that need changes — keep replit.md updated with what you change).
+1. Immediate auto-response on detection (no waiting for snapshot timer)
+	•	When any tracked action (channel delete, role delete, ban spree, etc.) crosses its threshold, immediately identify the responsible actor via the audit log entry’s executor.
+	•	First response: kick the executor and strip all their roles (remove roles before or as part of the kick so a re-join doesn’t restore privilege). Do NOT ban on first offense.
+	•	Track repeat offenses per-user in a guild-scoped counter persisted to DB, not memory — must survive a restart. If the same user/bot ID triggers a violation again after being kicked, escalate to a permanent ban.
+	•	If the executor is a bot, also revoke its OAuth integration / kick it via the guild’s integrations endpoint where possible, since kicking alone doesn’t always remove a malicious bot’s webhook or app access.
+2. Immediate restore, not delayed
+	•	Restore must trigger as part of the same violation-handling flow, not depend on the 5-minute scheduleGuildSnapshot cron. The cron only captures state. Build a separate triggerEmergencyRestore(guildId) function called directly from the violation handler.
+	•	Keep the last 2-3 snapshots, not just the latest, in case an attack started mid-snapshot-write and corrupted the newest one. Restore logic should fall back to the next-most-recent valid snapshot automatically if the newest is incomplete/corrupted.
+3. Fix duplicate-channel/role bug on restore — this is the critical part
+	•	Before creating any channel or role during restore, re-fetch the live current guild state (not the snapshot) and check if an entity with that name/position/type already exists. Only create what’s actually missing.
+	•	Match existing-vs-snapshot entities by a stored stable ID where possible (cache snapshotId -> liveId mappings from previous restores), falling back to name+type+parent match only when no ID match exists.
+	•	Make the restore function idempotent: running it twice in a row must never create duplicates.
+4. Correct ordering on restore
+	•	Restore roles first (recreate deleted roles with original permissions/color/hoist/position before anything else).
+	•	Then restore categories, then restore channels into their correct parent category, preserving position order.
+	•	Then reapply permission overwrites on channels, mapping old role IDs to newly-recreated role IDs via the ID-mapping cache from step 3.
+	•	Reapply server-wide settings (verification level, etc.) last.
+5. Clean up attacker-created mess without touching legitimate concurrent changes
+	•	Only delete/revert entities whose audit-log creator matches the identified attacker’s user/bot ID and whose creation timestamp falls within the detected attack window. Never delete channels/roles created by other legitimate admins around the same time.
+6. Fix the manual -antinuke restore command
+	•	It must share the exact same restore engine as automatic emergency restore — do not maintain two separate restore code paths.
+	•	It must always use the latest valid snapshot for that guild (most recent one that completed writing successfully). If the newest is corrupted, fall back automatically and tell the user which snapshot timestamp was actually used.
+	•	Permission check: confirm only the configured admin/owner role can run it.
+	•	Confirmation step: since this is destructive/structural, reply with a summary first (snapshot timestamp, how many channels/roles will be created vs. already match) and require user confirmation (✅ react or confirm reply) before executing. The automatic emergency path never waits for confirmation — only the manual command does.
+	•	Results summary after running: channels created, roles created, items skipped (already existed), permission overwrites reapplied, total time taken.
+7. Testing — do not mark this done until all of these pass
+	•	Simulate a bot rapidly deleting 5 channels: confirm the attacker is kicked + roles stripped within the detection threshold.
+	•	Confirm restore recreates exactly 5 channels (not 10).
+	•	Run restore twice in a row immediately: confirm the second run makes zero changes.
+	•	Simulate the same user ID offending a second time: confirm it results in a ban, not another kick.
+	•	Manually delete 2-3 channels and a role in a test guild, run -antinuke restore, confirm it recreates exactly what was deleted with no duplicates, then run it again immediately and confirm no changes the second time.
+Report back: what was broken before, what you changed, and the actual results of each test above.

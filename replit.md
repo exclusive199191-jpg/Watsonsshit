@@ -32,6 +32,11 @@ Enterprise-grade Discord bot that protects servers from nuke attacks with real-t
 - **Incident log ring buffer**: in-memory only (max 25), resets on restart — intentional (no DB writes on hot path).
 - **Toggle keys default ON**: `checkToggle()` returns `true` if key absent from toggles JSON — new detections are auto-enabled for existing servers.
 - **Per-guild snapshot schedule**: `scheduleGuildSnapshot` runs every 5 min per guild; `GuildCreate` event auto-registers new guilds.
+- **No-skip punishment**: ALL violators (bots and humans) are punished — only the server owner is immune (Discord API limit). First offense = kick + strip ALL roles + bot OAuth revocation. Second+ offense = permanent ban. Offense count persisted to DB (`antinuke_offenses`) so it survives restarts.
+- **Snapshot ring buffer**: `guild_snapshot_history` keeps last 3 complete snapshots per guild. `loadSnapshot()` tries newest→oldest, falls back automatically if a snapshot is corrupt/empty. Legacy `guild_snapshots` table kept for backward compat.
+- **Emergency restore**: `triggerEmergencyRestore()` fires immediately on `chDelete`/`roleDelete` violations — no cron dependency. Cleans up attacker-created channels/roles first (only within attack window), then restores from snapshot.
+- **Idempotent restore**: matches by original ID → name+type+parent → name+type. Running restore twice makes zero changes on the second pass. Returns `RestoreStats` for reporting.
+- **Manual restore confirmation**: `-antinuke restore` requires ✅ reaction within 30s before executing. Shows dry-run preview (what would be created vs already exists) before confirming.
 
 ## Product — Commands (`-antinuke`)
 

@@ -1,4 +1,4 @@
-import { pgTable, text, boolean, integer, timestamp } from "drizzle-orm/pg-core";
+import { pgTable, text, boolean, integer, timestamp, serial, primaryKey } from "drizzle-orm/pg-core";
 
 export const antinukeConfigTable = pgTable("antinuke_config", {
   guildId:                 text("guild_id").primaryKey(),
@@ -34,6 +34,29 @@ export const guildSnapshotTable = pgTable("guild_snapshots", {
   takenAt:      timestamp("taken_at", { withTimezone: true }).notNull().defaultNow(),
 });
 
+// Multi-snapshot history: keeps last 3 snapshots per guild for fallback
+export const guildSnapshotHistoryTable = pgTable("guild_snapshot_history", {
+  id:           serial("id").primaryKey(),
+  guildId:      text("guild_id").notNull(),
+  guildName:    text("guild_name").notNull().default(""),
+  channelsJson: text("channels_json").notNull().default("[]"),
+  rolesJson:    text("roles_json").notNull().default("[]"),
+  takenAt:      timestamp("taken_at", { withTimezone: true }).notNull().defaultNow(),
+  isComplete:   boolean("is_complete").notNull().default(false),
+});
+
+// Persistent per-user offense counter — survives restarts, drives kick→ban escalation
+export const antinukeOffensesTable = pgTable("antinuke_offenses", {
+  guildId:      text("guild_id").notNull(),
+  userId:       text("user_id").notNull(),
+  offenseCount: integer("offense_count").notNull().default(1),
+  lastOffenseAt: timestamp("last_offense_at", { withTimezone: true }).notNull().defaultNow(),
+}, (table) => ({
+  pk: primaryKey({ columns: [table.guildId, table.userId] }),
+}));
+
 export type AntiNukeConfigRow = typeof antinukeConfigTable.$inferSelect;
 export type InsertAntiNukeConfig = typeof antinukeConfigTable.$inferInsert;
 export type GuildSnapshotRow = typeof guildSnapshotTable.$inferSelect;
+export type GuildSnapshotHistoryRow = typeof guildSnapshotHistoryTable.$inferSelect;
+export type AntiNukeOffenseRow = typeof antinukeOffensesTable.$inferSelect;

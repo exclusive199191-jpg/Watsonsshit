@@ -101,6 +101,36 @@ export async function runMigrations() {
       `);
       await client.query(`ALTER TABLE guild_snapshots ADD COLUMN IF NOT EXISTS guild_name TEXT NOT NULL DEFAULT ''`);
 
+      // ── guild_snapshot_history ─────────────────────────────────────────────
+      // Keeps last 3 snapshots per guild so restore can fall back if newest is corrupt
+      await client.query(`
+        CREATE TABLE IF NOT EXISTS guild_snapshot_history (
+          id            SERIAL      PRIMARY KEY,
+          guild_id      TEXT        NOT NULL,
+          guild_name    TEXT        NOT NULL DEFAULT '',
+          channels_json TEXT        NOT NULL DEFAULT '[]',
+          roles_json    TEXT        NOT NULL DEFAULT '[]',
+          taken_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+          is_complete   BOOLEAN     NOT NULL DEFAULT FALSE
+        )
+      `);
+      await client.query(`
+        CREATE INDEX IF NOT EXISTS idx_guild_snapshot_history_guild
+          ON guild_snapshot_history (guild_id, taken_at DESC)
+      `);
+
+      // ── antinuke_offenses ──────────────────────────────────────────────────
+      // Persistent repeat-offense counter per user/guild — survives restarts
+      await client.query(`
+        CREATE TABLE IF NOT EXISTS antinuke_offenses (
+          guild_id        TEXT        NOT NULL,
+          user_id         TEXT        NOT NULL,
+          offense_count   INT         NOT NULL DEFAULT 1,
+          last_offense_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+          PRIMARY KEY (guild_id, user_id)
+        )
+      `);
+
       logger.info(`Database migrations complete — tables are ready. (host: ${host})`);
       setDbTableReady(true);
       return;
