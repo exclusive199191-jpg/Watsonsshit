@@ -737,43 +737,70 @@ async function restoreFromSnapshot(guild: Guild, config: AntiNukeConfig): Promis
 }
 
 // ── Emergency restore (called immediately on violation, no cron dependency) ──
+// ALWAYS wipes the attacker's created junk and restores deleted items.
 
-async function triggerEmergencyRestore(guild: Guild, attackerId: string, attackWindowMs: number): Promise<void> {
+const EMERGENCY_CLEANUP_WINDOW_MS = 5 * 60 * 1000; // 5 min — wide enough for any realistic attack
+
+async function triggerEmergencyRestore(guild: Guild, attackerId: string): Promise<void> {
   const config = await getConfig(guild.id);
   if (!config) return;
 
-  // First: clean up channels/roles that the attacker created during the attack window
-  // (only delete entities whose audit-log creator is the attacker within the attack time)
-  try {
-    const attackWindowStart = Date.now() - attackWindowMs;
-    // Fetch recent audit log entries for channel/role creates
-    const auditLogs = await guild.fetchAuditLogs({ limit: 25 }).catch(() => null);
-    if (auditLogs) {
-      for (const entry of auditLogs.entries.values()) {
-        if (entry.executor?.id !== attackerId) continue;
-        if (entry.createdTimestamp < attackWindowStart) continue;
+  const attackWindowStart = Date.now() - EMERGENCY_CLEANUP_WINDOW_MS;
 
-        const { AuditLogEvent: ALE } = await import("discord.js");
-        if (entry.action === ALE.ChannelCreate) {
-          const targetId = (entry.target as { id?: string } | null)?.id;
-          if (targetId) {
-            const ch = guild.channels.cache.get(targetId);
-            if (ch) await ch.delete("Anti-nuke: removing attacker-created channel").catch(() => null);
-          }
-        } else if (entry.action === ALE.RoleCreate) {
-          const targetId = (entry.target as { id?: string } | null)?.id;
-          if (targetId) {
-            const role = guild.roles.cache.get(targetId);
-            if (role && !role.managed) await role.delete("Anti-nuke: removing attacker-created role").catch(() => null);
-          }
-        }
+  // ── Step 1: delete channels/roles the attacker CREATED (within 5-min window) ─
+  try {
+    // Re-fetch live state before we start deleting so the cache is current
+    await guild.channels.fetch();
+    await guild.roles.fetch();
+
+    // Pull audit log in batches covering channel & role creates
+    const [chCreateLogs, roleCreateLogs] = await Promise.all([
+      guild.fetchAuditLogs({ limit: 50, type: AuditLogEvent.ChannelCreate }).catch(() => null),
+      guild.fetchAuditLogs({ limit: 50, type: AuditLogEvent.RoleCreate }).catch(() => null),
+    ]);
+
+    const toDeleteChannels: string[] = [];
+    const toDeleteRoles: string[] = [];
+
+    for (const entry of (chCreateLogs?.entries.values() ?? [])) {
+      if (entry.executor?.id !== attackerId) continue;
+      if (entry.createdTimestamp < attackWindowStart) continue;
+      const targetId = (entry.target as { id?: string } | null)?.id;
+      if (targetId) toDeleteChannels.push(targetId);
+    }
+
+    for (const entry of (roleCreateLogs?.entries.values() ?? [])) {
+      if (entry.executor?.id !== attackerId) continue;
+      if (entry.createdTimestamp < attackWindowStart) continue;
+      const targetId = (entry.target as { id?: string } | null)?.id;
+      if (targetId) toDeleteRoles.push(targetId);
+    }
+
+    for (const chId of toDeleteChannels) {
+      const ch = guild.channels.cache.get(chId);
+      if (ch) {
+        await ch.delete("Anti-nuke: removing attacker-created channel").catch(() => null);
+        logger.info({ guildId: guild.id, channelId: chId }, "Attacker channel deleted");
       }
     }
+
+    for (const roleId of toDeleteRoles) {
+      const role = guild.roles.cache.get(roleId);
+      if (role && !role.managed) {
+        await role.delete("Anti-nuke: removing attacker-created role").catch(() => null);
+        logger.info({ guildId: guild.id, roleId }, "Attacker role deleted");
+      }
+    }
+
+    logger.info(
+      { guildId: guild.id, chDeleted: toDeleteChannels.length, rolesDeleted: toDeleteRoles.length },
+      "Attacker cleanup complete"
+    );
   } catch (err: any) {
-    logger.warn(`Attacker cleanup error: ${err?.message}`);
+    logger.error(`Attacker cleanup error in guild ${guild.id}: ${err?.message}`);
   }
 
-  // Then: restore from snapshot (recreates deleted channels/roles)
+  // ── Step 2: restore channels/roles the attacker DELETED ──────────────────
   restoreFromSnapshot(guild, config).catch((err: any) => {
     logger.error(`Emergency restore error for guild ${guild.id}: ${err?.message}`);
   });
@@ -865,8 +892,7 @@ const PUNISH_LABEL: Record<PunishResult, string> = {
 
 let _client: Client | null = null;
 
-// Actions that indicate a server is being destroyed — trigger auto-restore
-const RESTORE_TRIGGERS = new Set(["chDelete", "roleDelete"]);
+// (All violations now trigger emergency restore — no per-action filter needed)
 
 async function handleViolation(
   guild: Guild,
@@ -927,12 +953,11 @@ async function handleViolation(
     }
   }
 
-  // Immediate emergency restore for destructive actions — no cron delay
-  if (RESTORE_TRIGGERS.has(actionKey)) {
-    triggerEmergencyRestore(guild, executor.id, config.timeWindowMs).catch((err: any) => {
-      logger.error(`Emergency restore error for guild ${guild.id}: ${err?.message}`);
-    });
-  }
+  // Immediate emergency restore for ANY violation — wipes attacker's created junk
+  // and rebuilds anything they deleted. Never wait for the 5-min snapshot cron.
+  triggerEmergencyRestore(guild, executor.id).catch((err: any) => {
+    logger.error(`Emergency restore error for guild ${guild.id}: ${err?.message}`);
+  });
 }
 
 // ── Audit log event handler ──────────────────────────────────────────────────
@@ -1526,8 +1551,8 @@ async function cmdRestore(message: Message): Promise<void> {
 
   const snapTs = `<t:${Math.floor(snap.takenAt.getTime() / 1000)}:F>`;
 
-  // Send confirmation embed and wait for ✅ reaction from the command author
-  const confirmMsg = await message.reply({
+  // Send confirmation prompt — wait for the author to reply "confirm" within 30s
+  await message.reply({
     embeds: [
       new EmbedBuilder()
         .setColor(Colors.Yellow)
@@ -1537,31 +1562,28 @@ async function cmdRestore(message: Message): Promise<void> {
           `**Preview (dry-run):**\n` +
           `📁 Channels to create: **${channelsToCreate}**  ·  already present: **${channelsPresent}**\n` +
           `🔑 Roles to create: **${rolesToCreate}**  ·  already present: **${rolesPresent}**\n\n` +
-          `React with ✅ within **30 seconds** to confirm, or ❌ to cancel.`
+          `Type **\`confirm\`** in this channel within **30 seconds** to proceed, or anything else to cancel.`
         )
         .setFooter({ text: "Anti-Nuke System  ·  Manual Restore" })
         .setTimestamp(),
     ],
   });
 
-  await confirmMsg.react("✅").catch(() => null);
-  await confirmMsg.react("❌").catch(() => null);
-
   let confirmed = false;
   try {
-    const collected = await confirmMsg.awaitReactions({
-      filter: (r, u) => ["✅", "❌"].includes(r.emoji.name ?? "") && u.id === message.author.id,
+    const collected = await message.channel.awaitMessages({
+      filter: (m) => m.author.id === message.author.id,
       max: 1,
       time: 30_000,
       errors: ["time"],
     });
-    confirmed = collected.first()?.emoji.name === "✅";
+    confirmed = collected.first()?.content.trim().toLowerCase() === "confirm";
   } catch {
     confirmed = false;
   }
 
   if (!confirmed) {
-    await confirmMsg.edit({ embeds: [infoEmbed("Restore Cancelled", "No confirmation received — restore aborted.")] }).catch(() => null);
+    await message.reply({ embeds: [infoEmbed("Restore Cancelled", "Confirmation not received — restore aborted.")] });
     return;
   }
 
