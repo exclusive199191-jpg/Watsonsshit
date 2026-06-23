@@ -47,7 +47,27 @@ function recordIncident(guildId: string, inc: Omit<Incident, "at">): void {
 
 // ── Join tracker for raid detection (per guild) ───────────────────────────────
 
-const joinTracker = new Map<string, number[]>(); // guildId → join timestamps
+// Tracks both timestamps AND member IDs so we can ban them during a raid
+const joinTracker = new Map<string, Array<{ id: string; ts: number }>>(); // guildId → {memberId, timestamp}[]
+
+// Raid mode: guild → expiry timestamp. Any join while active is instantly banned.
+const raidMode = new Map<string, number>(); // guildId → expiry ms timestamp
+const RAID_MODE_DURATION_MS = 5 * 60 * 1000; // 5 minutes
+
+function isRaidMode(guildId: string): boolean {
+  const exp = raidMode.get(guildId);
+  if (!exp) return false;
+  if (Date.now() > exp) { raidMode.delete(guildId); return false; }
+  return true;
+}
+
+function setRaidMode(guildId: string): void {
+  raidMode.set(guildId, Date.now() + RAID_MODE_DURATION_MS);
+}
+
+export function clearRaidMode(guildId: string): void {
+  raidMode.delete(guildId);
+}
 
 // ── Sliding-window rate tracker ─────────────────────────────────────────────
 // Uses per-action timestamp queues so async/delayed burst attacks are caught
@@ -344,16 +364,29 @@ async function restoreFromSnapshot(guild: Guild, config: AntiNukeConfig): Promis
     // ── Restore roles ──────────────────────────────────────────────────────
     // Map: old role ID → live role ID (needed to remap permission overwrites)
     const roleIdMap = new Map<string, string>();
+    // Restore from lowest position to highest so hierarchy is correct
     const sortedRoles = [...snap.roles].sort((a, b) => a.position - b.position);
 
     for (const roleSnap of sortedRoles) {
       if (roleSnap.managed) continue;
       // Match by original ID first, then by exact name — never create a duplicate
-      const existing =
-        guild.roles.cache.get(roleSnap.id) ??
-        guild.roles.cache.find(r => r.name === roleSnap.name);
+      const existingById = guild.roles.cache.get(roleSnap.id);
+      const existingByName = guild.roles.cache.find(r => r.name === roleSnap.name && !r.managed);
+      const existing = existingById ?? existingByName;
+
       if (existing) {
         roleIdMap.set(roleSnap.id, existing.id);
+        // Repair the role if it was modified (wrong permissions / colour)
+        try {
+          await existing.edit({
+            name: roleSnap.name,
+            color: roleSnap.color,
+            hoist: roleSnap.hoist,
+            mentionable: roleSnap.mentionable,
+            permissions: BigInt(roleSnap.permissions),
+            reason: "Anti-nuke: repairing modified role",
+          });
+        } catch { /* best-effort */ }
         continue;
       }
       try {
@@ -373,6 +406,9 @@ async function restoreFromSnapshot(guild: Guild, config: AntiNukeConfig): Promis
       }
     }
 
+    // Re-fetch live channels after role work
+    await guild.channels.fetch();
+
     // ── Restore channels ───────────────────────────────────────────────────
     // Remap overwrite role IDs in case roles were recreated with new IDs
     function remapOverwrites(overwrites: ChannelSnap["permissionOverwrites"]) {
@@ -384,7 +420,7 @@ async function restoreFromSnapshot(guild: Guild, config: AntiNukeConfig): Promis
       }));
     }
 
-    // Categories first (sorted by position), then everything else
+    // Categories first (sorted by snapshot position), then child channels
     const categories = snap.channels
       .filter(c => c.type === ChannelType.GuildCategory)
       .sort((a, b) => a.position - b.position);
@@ -396,15 +432,21 @@ async function restoreFromSnapshot(guild: Guild, config: AntiNukeConfig): Promis
     const categoryIdMap = new Map<string, string>();
 
     for (const catSnap of categories) {
-      // Skip if already present by ID or by name (never duplicate)
+      // 1. Match by original ID
+      // 2. Match by name (case-insensitive) among existing categories
       const existing =
         guild.channels.cache.get(catSnap.id) ??
         guild.channels.cache.find(
           c => c.name.toLowerCase() === catSnap.name.toLowerCase() &&
                c.type === ChannelType.GuildCategory
         );
+
       if (existing) {
         categoryIdMap.set(catSnap.id, existing.id);
+        // Repair name if it was changed
+        if (existing.name !== catSnap.name) {
+          await existing.setName(catSnap.name, "Anti-nuke: restoring category name").catch(() => null);
+        }
         continue;
       }
       try {
@@ -412,7 +454,6 @@ async function restoreFromSnapshot(guild: Guild, config: AntiNukeConfig): Promis
         const created = await guild.channels.create({
           name: catSnap.name,
           type: ChannelType.GuildCategory,
-          position: catSnap.position,
           permissionOverwrites: remapOverwrites(catSnap.permissionOverwrites),
           reason: "Anti-nuke: restoring deleted category",
         });
@@ -423,12 +464,16 @@ async function restoreFromSnapshot(guild: Guild, config: AntiNukeConfig): Promis
       }
     }
 
+    // After all categories are present, resolve parentId for child channels
     for (const chSnap of otherChannels) {
-      // Skip if already present by ID or by name+type in the same parent (never duplicate)
       const resolvedParentId = chSnap.parentId
         ? (categoryIdMap.get(chSnap.parentId) ?? chSnap.parentId)
         : null;
 
+      // Dedup strategy (most-specific → least-specific):
+      // 1. Exact original ID
+      // 2. Same name + type + same resolved parent
+      // 3. Same name + type (anywhere in the guild — catches channels moved by attacker)
       const existing =
         guild.channels.cache.get(chSnap.id) ??
         guild.channels.cache.find(
@@ -436,8 +481,27 @@ async function restoreFromSnapshot(guild: Guild, config: AntiNukeConfig): Promis
             c.name.toLowerCase() === chSnap.name.toLowerCase() &&
             c.type === chSnap.type &&
             (c as GuildChannel).parentId === resolvedParentId
+        ) ??
+        guild.channels.cache.find(
+          c =>
+            c.name.toLowerCase() === chSnap.name.toLowerCase() &&
+            c.type === chSnap.type
         );
-      if (existing) continue;
+
+      if (existing) {
+        // Repair: rename, move to correct category, restore overwrites if drifted
+        const gc = existing as GuildChannel;
+        const needsRename  = gc.name !== chSnap.name;
+        const needsMove    = resolvedParentId !== null && gc.parentId !== resolvedParentId;
+        if (needsRename || needsMove) {
+          await gc.edit({
+            ...(needsRename ? { name: chSnap.name } : {}),
+            ...(needsMove   ? { parent: resolvedParentId ?? undefined } : {}),
+            reason: "Anti-nuke: repairing channel drift",
+          }).catch(() => null);
+        }
+        continue;
+      }
 
       try {
         await delay(600);
@@ -446,7 +510,6 @@ async function restoreFromSnapshot(guild: Guild, config: AntiNukeConfig): Promis
             name: chSnap.name,
             type: chSnap.type as ChannelType.GuildText | ChannelType.GuildAnnouncement,
             parent: resolvedParentId ?? undefined,
-            position: chSnap.position,
             topic: chSnap.topic ?? undefined,
             nsfw: chSnap.nsfw,
             rateLimitPerUser: chSnap.rateLimitPerUser,
@@ -458,7 +521,6 @@ async function restoreFromSnapshot(guild: Guild, config: AntiNukeConfig): Promis
             name: chSnap.name,
             type: chSnap.type as ChannelType.GuildVoice | ChannelType.GuildStageVoice,
             parent: resolvedParentId ?? undefined,
-            position: chSnap.position,
             bitrate: chSnap.bitrate ?? undefined,
             userLimit: chSnap.userLimit ?? undefined,
             permissionOverwrites: remapOverwrites(chSnap.permissionOverwrites),
@@ -469,7 +531,6 @@ async function restoreFromSnapshot(guild: Guild, config: AntiNukeConfig): Promis
             name: chSnap.name,
             type: ChannelType.GuildForum,
             parent: resolvedParentId ?? undefined,
-            position: chSnap.position,
             permissionOverwrites: remapOverwrites(chSnap.permissionOverwrites),
             reason: "Anti-nuke: restoring deleted channel",
           });
@@ -478,6 +539,45 @@ async function restoreFromSnapshot(guild: Guild, config: AntiNukeConfig): Promis
       } catch (err: any) {
         logger.error(`Failed to restore channel "${chSnap.name}": ${err?.message}`);
       }
+    }
+
+    // ── Enforce exact channel positions ───────────────────────────────────
+    // Re-fetch so we have the freshest cache after all creates/repairs
+    await guild.channels.fetch();
+
+    // Build the position update list: map each snapshot channel to its live ID,
+    // sorted by the original snapshot position. Categories and channels are
+    // ordered together by Discord's global position value.
+    const positionUpdates: Array<{ channel: string; position: number; parent?: string | null }> = [];
+
+    for (const chSnap of [...snap.channels].sort((a, b) => a.position - b.position)) {
+      const liveId =
+        guild.channels.cache.get(chSnap.id)?.id ??
+        guild.channels.cache.find(
+          c =>
+            c.name.toLowerCase() === chSnap.name.toLowerCase() &&
+            c.type === chSnap.type
+        )?.id;
+
+      if (!liveId) continue;
+
+      const resolvedParentId = chSnap.parentId
+        ? (categoryIdMap.get(chSnap.parentId) ?? chSnap.parentId)
+        : null;
+
+      positionUpdates.push({
+        channel: liveId,
+        position: chSnap.position,
+        ...(chSnap.type !== ChannelType.GuildCategory ? { parent: resolvedParentId } : {}),
+      });
+    }
+
+    if (positionUpdates.length > 0) {
+      await guild.channels.setPositions(positionUpdates as any, {
+        reason: "Anti-nuke: enforcing snapshot channel order",
+      }).catch((err: any) =>
+        logger.warn(`setPositions failed (non-fatal): ${err?.message}`)
+      );
     }
   } finally {
     // ── Always unlock @everyone when done, even if restore partially failed ─
@@ -802,45 +902,105 @@ export async function onGuildMemberAdd(member: GuildMember): Promise<void> {
   const config = await getConfig(guild.id);
   if (!config?.enabled) return;
 
-  // ── Raid join flood ──────────────────────────────────────────────────────
-  if (checkToggle(config, "raidJoin")) {
-    const now = Date.now();
-    const prev = joinTracker.get(guild.id) ?? [];
-    const within = prev.filter(t => now - t <= config.raidJoinWindowMs);
-    within.push(now);
-    joinTracker.set(guild.id, within);
-
-    if (within.length >= config.raidJoinThreshold) {
-      joinTracker.delete(guild.id);
-      recordIncident(guild.id, {
-        violation: "Raid Join Flood",
-        executorId: "raid",
-        executorTag: "Raid",
-        count: within.length,
-        threshold: config.raidJoinThreshold,
-        result: "lockdown",
+  // ── Raid mode: instantly ban anyone who joins while active ────────────────
+  if (isRaidMode(guild.id)) {
+    logger.warn(`Raid mode active — banning joining member ${member.id} (${member.user.tag}) in guild ${guild.id}`);
+    try {
+      await guild.members.ban(member.id, {
+        deleteMessageSeconds: 86400,
+        reason: "Anti-nuke: server is in raid-mode lockdown — join rejected and banned",
       });
-      logger.warn(`Raid detected in guild ${guild.id} — ${within.length} joins in ${config.raidJoinWindowMs / 1000}s`);
+    } catch (err: any) {
+      logger.error(`Raid-mode ban failed for ${member.id}: ${err?.message}`);
+    }
 
-      if (config.logChannelId) {
-        const ch = guild.channels.cache.get(config.logChannelId);
-        if (ch && "send" in ch) {
-          await (ch as TextChannel).send({
-            embeds: [
-              new EmbedBuilder()
-                .setColor(Colors.DarkRed)
-                .setTitle("RAID DETECTED")
-                .setDescription(
-                  `**${within.length}** accounts joined **${guild.name}** within **${config.raidJoinWindowMs / 1000}s**.\n` +
-                  `Threshold: ${config.raidJoinThreshold} joins in ${config.raidJoinWindowMs / 1000}s.\n\n` +
-                  `Use \`-antinuke lockdown\` to lock the server immediately.`
-                )
-                .setFooter({ text: "Anti-Nuke System  ·  Raid Detection" })
-                .setTimestamp(),
-            ],
-          }).catch(() => null);
-        }
+    if (config.logChannelId) {
+      const ch = guild.channels.cache.get(config.logChannelId);
+      if (ch && "send" in ch) {
+        await (ch as TextChannel).send({
+          embeds: [
+            new EmbedBuilder()
+              .setColor(Colors.DarkRed)
+              .setTitle("RAID MODE — Member Banned on Join")
+              .setDescription(
+                `<@${member.id}> (\`${member.user.tag}\`) attempted to join during raid-mode lockdown and was **instantly banned**.\n\n` +
+                `Raid mode expires <t:${Math.floor((raidMode.get(guild.id) ?? Date.now()) / 1000)}:R>. ` +
+                `Use \`-antinuke raidmode off\` to lift it early.`
+              )
+              .setFooter({ text: "Anti-Nuke System  ·  Raid Mode" })
+              .setTimestamp(),
+          ],
+        }).catch(() => null);
       }
+    }
+    return;
+  }
+
+  // ── Raid join flood detection ─────────────────────────────────────────────
+  if (!checkToggle(config, "raidJoin")) return;
+
+  const now = Date.now();
+  const prev = joinTracker.get(guild.id) ?? [];
+  // Prune expired entries and add current member
+  const within = prev.filter(e => now - e.ts <= config.raidJoinWindowMs);
+  within.push({ id: member.id, ts: now });
+  joinTracker.set(guild.id, within);
+
+  if (within.length < config.raidJoinThreshold) return;
+
+  // Threshold exceeded — this is a raid
+  joinTracker.delete(guild.id);
+  setRaidMode(guild.id);
+
+  const raidExpiry = Math.floor((raidMode.get(guild.id) ?? Date.now()) / 1000);
+
+  recordIncident(guild.id, {
+    violation: "Raid Join Flood",
+    executorId: "raid",
+    executorTag: "Raid",
+    count: within.length,
+    threshold: config.raidJoinThreshold,
+    result: `banned ${within.length} members, raid-mode active`,
+  });
+
+  logger.warn(`Raid detected in guild ${guild.id} — ${within.length} joins in ${config.raidJoinWindowMs / 1000}s — banning all & entering raid mode`);
+
+  // Ban every member who joined in this flood window
+  let banned = 0;
+  let failed = 0;
+  for (const entry of within) {
+    try {
+      await guild.members.ban(entry.id, {
+        deleteMessageSeconds: 86400,
+        reason: `Anti-nuke: raid detection — mass join flood (${within.length} in ${config.raidJoinWindowMs / 1000}s)`,
+      });
+      banned++;
+    } catch {
+      failed++;
+    }
+  }
+
+  logger.info(`Raid response: banned ${banned}/${within.length} members in guild ${guild.id}`);
+
+  if (config.logChannelId) {
+    const ch = guild.channels.cache.get(config.logChannelId);
+    if (ch && "send" in ch) {
+      await (ch as TextChannel).send({
+        embeds: [
+          new EmbedBuilder()
+            .setColor(Colors.DarkRed)
+            .setTitle("🚨 RAID DETECTED — AUTO-BANNED")
+            .setDescription(
+              `**${within.length}** accounts joined **${guild.name}** within **${config.raidJoinWindowMs / 1000}s** — threshold: ${config.raidJoinThreshold}.\n\n` +
+              `✅ Banned: **${banned}** members\n` +
+              `${failed > 0 ? `⚠️ Failed: **${failed}** (hierarchy/already left)\n` : ""}` +
+              `🔒 **Raid mode is now ACTIVE** — every new join will be instantly banned.\n` +
+              `Expires: <t:${raidExpiry}:R> or use \`-antinuke raidmode off\` to lift immediately.`
+            )
+            .setFooter({ text: "Anti-Nuke System  ·  Raid Detection" })
+            .setTimestamp(),
+        ],
+      }).catch(() => null);
     }
   }
 }
@@ -1284,6 +1444,51 @@ async function cmdUnlock(message: Message): Promise<void> {
   )] });
 }
 
+// ── Raid-mode command ────────────────────────────────────────────────────────
+
+async function cmdRaidMode(message: Message, args: string[]): Promise<void> {
+  if (!message.guild) return;
+
+  const sub = args[0]?.toLowerCase();
+
+  if (sub === "off") {
+    if (!isRaidMode(message.guild.id)) {
+      await message.reply({ embeds: [infoEmbed("Raid Mode", "Raid mode is not currently active.")] });
+      return;
+    }
+    clearRaidMode(message.guild.id);
+    await message.reply({ embeds: [okEmbed("Raid Mode Lifted", "Raid mode has been disabled. New joins will no longer be auto-banned.")] });
+    return;
+  }
+
+  if (sub === "on") {
+    setRaidMode(message.guild.id);
+    const exp = Math.floor((raidMode.get(message.guild.id) ?? Date.now()) / 1000);
+    await message.reply({ embeds: [okEmbed(
+      "Raid Mode Activated",
+      `🔒 Every account that joins this server will be **instantly banned** until:\n` +
+      `• <t:${exp}:R> (auto-expires in 5 minutes)\n` +
+      `• Or you run \`-antinuke raidmode off\` to lift it early.`
+    )] });
+    return;
+  }
+
+  // Status
+  const active = isRaidMode(message.guild.id);
+  if (active) {
+    const exp = Math.floor((raidMode.get(message.guild.id) ?? Date.now()) / 1000);
+    await message.reply({ embeds: [infoEmbed(
+      "Raid Mode — ACTIVE 🔒",
+      `All joining accounts are being instantly banned.\nAuto-expires: <t:${exp}:R>\nUse \`-antinuke raidmode off\` to lift immediately.`
+    )] });
+  } else {
+    await message.reply({ embeds: [infoEmbed(
+      "Raid Mode — Inactive",
+      "Raid mode is not active. Use `-antinuke raidmode on` to activate it manually, or it will activate automatically when a join flood is detected."
+    )] });
+  }
+}
+
 async function cmdHelp(message: Message): Promise<void> {
   await showAntiNukeHelp(message);
 }
@@ -1301,8 +1506,10 @@ export async function showAntiNukeHelp(message: Message): Promise<void> {
         name: "Control",
         value:
           "`enable` · `disable` · `status` · `reset`\n" +
-          "`lockdown` — lock all channels immediately\n" +
-          "`unlock` — restore channel access",
+          "`lockdown` — remove Send Messages from all channels\n" +
+          "`unlock` — restore channel access\n" +
+          "`raidmode on|off` — manually activate/deactivate instant-ban on join\n" +
+          "`raidmode` — check current raid-mode status",
         inline: false,
       },
       {
@@ -1420,6 +1627,7 @@ export async function handleAntiNukeCommand(message: Message, args: string[]): P
     case "stats":     return cmdStats(message);
     case "lockdown":  return cmdLockdown(message);
     case "unlock":    return cmdUnlock(message);
+    case "raidmode":  return cmdRaidMode(message, args.slice(1));
     default:          return cmdHelp(message);
   }
 }
