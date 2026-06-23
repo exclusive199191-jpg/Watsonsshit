@@ -11,12 +11,20 @@ import {
   type GuildMember,
 } from "discord.js";
 import { db } from "@workspace/db";
-import { roleAssignmentsTable } from "@workspace/db";
+import { roleAssignmentsTable, antinukeConfigTable } from "@workspace/db";
 import { eq, and, desc, sql } from "drizzle-orm";
 import { logger } from "./lib/logger";
 import { isDbTableReady } from "./db-state";
 import { runMigrations } from "./migrate";
-import { registerAntiNukeListeners, handleAntiNukeCommand, handleAntiNukeMessage, showAntiNukeHelp } from "./antinuke";
+import {
+  registerAntiNukeListeners,
+  handleAntiNukeCommand,
+  handleAntiNukeMessage,
+  showAntiNukeHelp,
+  startSnapshotSchedule,
+  scheduleGuildSnapshot,
+  stopSnapshotSchedule,
+} from "./antinuke";
 
 // ── Permission detection ───────────────────────────────────────────────────────
 
@@ -1447,6 +1455,37 @@ export async function startBot() {
     } else {
       logger.info("Bot ready and database table verified — all systems operational.");
     }
+
+    // Start periodic snapshots for every guild the bot is already in
+    startSnapshotSchedule(readyClient);
+  });
+
+  // ── Auto-enable anti-nuke when the bot joins a new guild ──────────────────
+  client.on(Events.GuildCreate, async (guild) => {
+    logger.info({ guildId: guild.id, guildName: guild.name }, "Bot joined new guild — auto-enabling anti-nuke");
+
+    if (db) {
+      try {
+        await db
+          .insert(antinukeConfigTable)
+          .values({ guildId: guild.id, enabled: true })
+          .onConflictDoUpdate({
+            target: antinukeConfigTable.guildId,
+            set: { enabled: true },
+          });
+        logger.info({ guildId: guild.id }, "Anti-nuke auto-enabled for new guild");
+      } catch (err: any) {
+        logger.error(`Failed to auto-enable anti-nuke for guild ${guild.id}: ${err?.message}`);
+      }
+    }
+
+    // Take an initial snapshot and schedule periodic ones
+    scheduleGuildSnapshot(guild);
+  });
+
+  // ── Clean up snapshot schedule when the bot leaves a guild ────────────────
+  client.on(Events.GuildDelete, (guild) => {
+    stopSnapshotSchedule(guild.id);
   });
 
   // ── Track role assignments and removals ──────────────────────────────────────

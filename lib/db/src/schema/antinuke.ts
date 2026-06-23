@@ -4,8 +4,8 @@ export const antinukeConfigTable = pgTable("antinuke_config", {
   guildId:                 text("guild_id").primaryKey(),
   enabled:                 boolean("enabled").notNull().default(false),
   logChannelId:            text("log_channel_id"),
-  punishment:              text("punishment").notNull().default("ban"),    // "ban" | "kick" | "strip"
-  whitelist:               text("whitelist").notNull().default("[]"),      // JSON array of user IDs
+  punishment:              text("punishment").notNull().default("ban"),
+  whitelist:               text("whitelist").notNull().default("[]"),
   banThreshold:            integer("ban_threshold").notNull().default(3),
   kickThreshold:           integer("kick_threshold").notNull().default(5),
   channelCreateThreshold:  integer("channel_create_threshold").notNull().default(5),
@@ -20,5 +20,13 @@ export const antinukeConfigTable = pgTable("antinuke_config", {
   updatedAt:               timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
 });
 
+export const guildSnapshotTable = pgTable("guild_snapshots", {
+  guildId:      text("guild_id").primaryKey(),
+  channelsJson: text("channels_json").notNull().default("[]"),
+  rolesJson:    text("roles_json").notNull().default("[]"),
+  takenAt:      timestamp("taken_at", { withTimezone: true }).notNull().defaultNow(),
+});
+
 export type AntiNukeConfigRow = typeof antinukeConfigTable.$inferSelect;
 export type InsertAntiNukeConfig = typeof antinukeConfigTable.$inferInsert;
+export type GuildSnapshotRow = typeof guildSnapshotTable.$inferSelect;

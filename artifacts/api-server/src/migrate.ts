@@ -82,6 +82,15 @@ export async function runMigrations() {
         )
       `);
 
+      await client.query(`
+        CREATE TABLE IF NOT EXISTS guild_snapshots (
+          guild_id      TEXT        PRIMARY KEY,
+          channels_json TEXT        NOT NULL DEFAULT '[]',
+          roles_json    TEXT        NOT NULL DEFAULT '[]',
+          taken_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )
+      `);
+
       logger.info(`Database migrations complete — tables are ready. (host: ${host})`);
       setDbTableReady(true);
       return;
