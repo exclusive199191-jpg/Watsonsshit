@@ -1311,6 +1311,78 @@ async function cmdExport(message: Message) {
   });
 }
 
+async function cmdDeleteAllChannels(message: Message, confirmed: boolean) {
+  if (!message.guild || !message.member) return;
+  if (
+    message.author.id !== message.guild.ownerId &&
+    !message.member.permissions.has(PermissionsBitField.Flags.Administrator)
+  ) {
+    await message.reply({ embeds: [errorEmbed("This command requires **Administrator** permission or server ownership.")] });
+    return;
+  }
+
+  if (!confirmed) {
+    await message.reply({
+      embeds: [
+        new EmbedBuilder()
+          .setColor(Colors.Red)
+          .setTitle("⚠️ Confirm: Delete ALL Channels")
+          .setDescription(
+            `This will permanently delete **every channel** in **${message.guild.name}**.\n\n` +
+            `Type \`,delete all channels confirm\` to proceed.\n\n` +
+            `**This cannot be undone unless you have an anti-nuke snapshot.**`
+          )
+          .setFooter({ text: "Waiting for confirmation" })
+          .setTimestamp(),
+      ],
+    });
+    return;
+  }
+
+  const guild = message.guild;
+  await guild.channels.fetch();
+  const channels = [...guild.channels.cache.values()];
+
+  const pending = await message.reply({
+    embeds: [
+      new EmbedBuilder()
+        .setColor(Colors.Orange)
+        .setTitle("Deleting All Channels…")
+        .setDescription(`Deleting **${channels.length}** channel(s). This may take a moment.`)
+        .setTimestamp(),
+    ],
+  }).catch(() => null);
+
+  let deleted = 0;
+  let failed = 0;
+  for (const ch of channels) {
+    try {
+      await ch.delete("Admin command: delete all channels");
+      deleted++;
+    } catch {
+      failed++;
+    }
+  }
+
+  // Try to log in any channel that still exists after the wipe
+  const remaining = [...guild.channels.cache.values()].find(c => "send" in c) as any;
+  const resultEmbed = new EmbedBuilder()
+    .setColor(failed > 0 ? Colors.Yellow : Colors.Green)
+    .setTitle("Channel Deletion Complete")
+    .setDescription(
+      `✅ Deleted: **${deleted}** channel(s)\n` +
+      (failed > 0 ? `⚠️ Failed: **${failed}** (missing permissions or already gone)\n` : "") +
+      `\nUse \`-antinuke restore\` to rebuild from the last snapshot.`
+    )
+    .setTimestamp();
+
+  if (remaining) {
+    await remaining.send({ embeds: [resultEmbed] }).catch(() => null);
+  } else if (pending) {
+    await pending.edit({ embeds: [resultEmbed] }).catch(() => null);
+  }
+}
+
 async function cmdLogs(message: Message) {
   if (!ERROR_LOG.length) {
     const embed = new EmbedBuilder()
@@ -1673,6 +1745,10 @@ export async function startBot() {
         await cmdTop(message, args);
       } else if (lower === "export") {
         await cmdExport(message);
+
+      // ── Destructive utility commands ────────────────────────────────────────
+      } else if (lower === "delete all channels" || lower === "delete all channels confirm") {
+        await cmdDeleteAllChannels(message, lower.endsWith("confirm"));
       }
       // Unknown commands are silently ignored to avoid noise
       break; // success — exit retry loop
