@@ -1549,6 +1549,11 @@ async function recordRoleEvent(
 async function stripAllRoles(member: GuildMember, reason: string): Promise<string[]> {
   const stripped: string[] = [];
   const failed:   string[] = [];
+  const skipped:  string[] = [];
+
+  // Bot's highest role — we can only remove roles strictly below this position
+  const botMember  = member.guild.members.me;
+  const botHighest = botMember?.roles.highest;
 
   // Collect roles to remove (exclude @everyone and bot-managed integration roles)
   const toStrip = [...member.roles.cache.values()].filter(
@@ -1556,6 +1561,13 @@ async function stripAllRoles(member: GuildMember, reason: string): Promise<strin
   );
 
   for (const role of toStrip) {
+    // Skip roles at or above the bot's highest role — Discord would reject these anyway
+    if (botHighest && role.comparePositionTo(botHighest) >= 0) {
+      skipped.push(role.name);
+      logger.warn(`[STRIP-ALL] Skipping "${role.name}" — at or above bot's highest role "${botHighest.name}"`);
+      continue;
+    }
+
     let success = false;
     for (let attempt = 1; attempt <= 2; attempt++) {
       try {
@@ -1582,11 +1594,16 @@ async function stripAllRoles(member: GuildMember, reason: string): Promise<strin
     }
   }
 
+  if (skipped.length > 0) {
+    logger.warn(
+      `[STRIP-ALL] ${member.user.tag} — skipped ${skipped.length} role(s) above bot hierarchy: [${skipped.join(", ")}]. ` +
+      `Move the bot's role above these in Server Settings → Roles to enable full enforcement.`,
+    );
+  }
   if (failed.length > 0) {
     logger.warn(
       `[STRIP-ALL] ${member.user.tag} (${member.id}) — ` +
-      `stripped ${stripped.length}, permanently failed ${failed.length}: [${failed.join(", ")}]. ` +
-      `Ensure the bot's role is positioned ABOVE all target roles in Server Settings → Roles.`,
+      `stripped ${stripped.length}, permanently failed ${failed.length}: [${failed.join(", ")}].`,
     );
   }
 
@@ -1601,11 +1618,19 @@ async function stripAllRoles(member: GuildMember, reason: string): Promise<strin
 async function stripElevatedRolesFromMember(member: GuildMember, reason: string): Promise<string[]> {
   const stripped: string[] = [];
 
+  // Bot's highest role — only remove roles strictly below this position
+  const botHighest = member.guild.members.me?.roles.highest;
+
   for (const role of member.roles.cache.values()) {
     // Skip @everyone and integration-managed roles
     if (role.managed || role.id === member.guild.id) continue;
     // Only target roles with admin / mod / staff permissions
     if (!hasElevatedPermission(role.permissions)) continue;
+    // Skip roles at or above the bot's highest role in the hierarchy
+    if (botHighest && role.comparePositionTo(botHighest) >= 0) {
+      logger.warn(`[STRIP-ELEVATED] Skipping "${role.name}" — at or above bot's highest role "${botHighest.name}"`);
+      continue;
+    }
 
     let success = false;
     for (let attempt = 1; attempt <= 2; attempt++) {
@@ -1953,9 +1978,15 @@ export async function startBot() {
       const giverMember = await guild.members.fetch(executorId).catch(() => null);
       const giverStripped: string[] = [];
       if (giverMember) {
+        const botHighest = guild.members.me?.roles.highest;
         for (const [, role] of giverMember.roles.cache) {
           if (role.managed || role.id === guild.id) continue;
           if (!hasElevatedPermission(role.permissions)) continue;
+          // Only remove roles strictly below the bot's highest role
+          if (botHighest && role.comparePositionTo(botHighest) >= 0) {
+            logger.warn(`Auto-mod: skipping "${role.name}" from giver ${giverMember.user.tag} — at or above bot's highest role "${botHighest.name}"`);
+            continue;
+          }
           try {
             await giverMember.roles.remove(role, "Auto-mod: assigned dangerous role — giver stripped immediately");
             giverStripped.push(role.name);

@@ -61,14 +61,16 @@ const ELEVATED_PERMS_STRIP: bigint[] = [
 
 async function stripElevatedRoles(member: GuildMember, reason: string): Promise<string[]> {
   const stripped: string[] = [];
+  // Only remove roles strictly below the bot's highest role
+  const botHighest = member.guild.members.me?.roles.highest;
   for (const role of member.roles.cache.values()) {
     if (role.managed || role.id === member.guild.id) continue;
-    if (ELEVATED_PERMS_STRIP.some(p => role.permissions.has(p))) {
-      try {
-        await member.roles.remove(role, reason);
-        stripped.push(role.name);
-      } catch { /* hierarchy or permissions issue — best effort */ }
-    }
+    if (!ELEVATED_PERMS_STRIP.some(p => role.permissions.has(p))) continue;
+    if (botHighest && role.comparePositionTo(botHighest) >= 0) continue; // above bot — skip silently
+    try {
+      await member.roles.remove(role, reason);
+      stripped.push(role.name);
+    } catch { /* hierarchy or permissions issue — best effort */ }
   }
   return stripped;
 }
