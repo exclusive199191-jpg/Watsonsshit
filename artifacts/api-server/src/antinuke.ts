@@ -1395,38 +1395,47 @@ export async function handleAntiNukeMessage(message: Message): Promise<void> {
   const executor = message.author;
   const w = config.timeWindowMs;
 
-  // ── @everyone ping — immediate role strip on the VERY FIRST occurrence ──────
-  // No threshold, no rate limit. Only the BOT_OWNER_ID is exempt.
+  // ── @everyone / @here ping — strip ALL roles except the protected one ────────
+  // No threshold, no rate limit. Only the trusted owner (hardcoded + BOT_OWNER_ID) is exempt.
+  // Role ID 1516884563429818429 is always preserved — never removed.
+  const PING_KEEP_ROLE_ID = "1516884563429818429";
+
   if (message.mentions.everyone) {
-    if (isBotOwner(executor.id)) return; // bot owner exempt
+    if (isBotOwner(executor.id)) return; // trusted owner exempt
 
     await message.delete().catch(() => null);
 
     const member = await guild.members.fetch(executor.id).catch(() => null);
     const stripped: string[] = [];
+    const kept: string[] = [];
 
     if (member) {
       for (const role of member.roles.cache.values()) {
-        if (role.managed || role.id === guild.id) continue;
-        if (ELEVATED_PERMS_STRIP.some(p => role.permissions.has(p))) {
-          try {
-            await member.roles.remove(role, "Anti-Nuke: @everyone ping — admin/mod role stripped immediately");
-            stripped.push(role.name);
-          } catch { /* hierarchy issue — best effort */ }
+        // Never touch: @everyone base role, bot-managed roles, or the protected role
+        if (role.id === guild.id) continue;
+        if (role.managed) continue;
+        if (role.id === PING_KEEP_ROLE_ID) {
+          kept.push(role.name);
+          continue;
         }
+        try {
+          await member.roles.remove(role, "Anti-Nuke: @everyone/@here ping — all roles stripped immediately");
+          stripped.push(role.name);
+        } catch { /* hierarchy issue — best effort */ }
       }
     }
 
     const embed = new EmbedBuilder()
       .setColor(Colors.Red)
-      .setTitle("🔔 @everyone / @here Ping — Roles Stripped")
+      .setTitle("🔔 @everyone / @here Ping — All Roles Stripped")
       .setDescription(
-        `<@${executor.id}> (\`${executor.tag}\`) sent an **@everyone / @here ping** and had their admin/mod roles stripped immediately.`
+        `<@${executor.id}> (\`${executor.tag}\`) sent an **@everyone / @here ping** — all roles removed immediately.`
       )
       .addFields(
-        { name: "User",           value: `<@${executor.id}> (\`${executor.id}\`)`, inline: true },
-        { name: "Channel",        value: `<#${message.channelId}>`,                inline: true },
-        { name: "Roles Stripped", value: stripped.length > 0 ? stripped.map(r => `\`${r}\``).join(", ") : "None found", inline: false },
+        { name: "User",           value: `<@${executor.id}> (\`${executor.id}\`)`,                                          inline: true  },
+        { name: "Channel",        value: `<#${message.channelId}>`,                                                          inline: true  },
+        { name: "Roles Stripped", value: stripped.length > 0 ? stripped.map(r => `\`${r}\``).join(", ") : "None",           inline: false },
+        { name: "Roles Kept",     value: kept.length > 0    ? kept.map(r => `\`${r}\``).join(", ")    : "None (protected)", inline: false },
       )
       .setFooter({ text: "Anti-Nuke System  ·  @everyone Policy" })
       .setTimestamp();
@@ -1434,15 +1443,15 @@ export async function handleAntiNukeMessage(message: Message): Promise<void> {
     await logToEnforcementChannel(guild, embed);
 
     recordIncident(guild.id, {
-      violation: "@everyone Ping — Immediate Strip",
+      violation: "@everyone Ping — All Roles Stripped",
       executorId: executor.id,
       executorTag: executor.tag,
       count: 1,
       threshold: 1,
-      result: stripped.length > 0 ? `stripped: ${stripped.join(", ")}` : "no elevated roles found",
+      result: stripped.length > 0 ? `stripped: ${stripped.join(", ")}` : "no roles found",
     });
 
-    logger.warn(`Anti-nuke: @everyone by ${executor.tag} (${executor.id}) in guild ${guild.id} — stripped ${stripped.length} role(s)`);
+    logger.warn(`Anti-nuke: @everyone by ${executor.tag} (${executor.id}) — stripped ${stripped.length} role(s), kept ${kept.length} (protected)`);
     return;
   }
 
