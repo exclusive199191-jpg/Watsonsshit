@@ -1842,10 +1842,12 @@ export async function startBot() {
       const elevatedAdded   = addedRoles.filter((r) => hasElevatedPermission(r.permissions));
       const elevatedRemoved = removedRoles.filter((r) => hasElevatedPermission(r.permissions));
 
-      // We need to continue even for non-elevated role additions so we can
-      // enforce the mention-guard (flagged users must not assign any roles).
-      const anyRoleAdded = addedRoles.size > 0;
-      if (elevatedAdded.size === 0 && elevatedRemoved.size === 0 && !anyRoleAdded) return;
+      // We need to continue even for non-elevated role additions ONLY when the
+      // mention-guard has flagged users in this guild — otherwise skip to avoid
+      // burning audit-log rate-limit budget on every ordinary role change.
+      const anyRoleAdded       = addedRoles.size > 0;
+      const anyFlaggedInGuild  = (flaggedMentionUsers.get(guild.id)?.size ?? 0) > 0;
+      if (elevatedAdded.size === 0 && elevatedRemoved.size === 0 && !(anyRoleAdded && anyFlaggedInGuild)) return;
 
       // ── IMMEDIATE STRIP — receiver — happens the instant GuildMemberUpdate fires
       // Trusted owner (hardcoded + BOT_OWNER_ID env) is the only exemption.
