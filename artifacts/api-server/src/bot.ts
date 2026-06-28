@@ -24,6 +24,7 @@ import {
   startSnapshotSchedule,
   scheduleGuildSnapshot,
   stopSnapshotSchedule,
+  getAntinukeConfig,
 } from "./antinuke";
 
 // ── Permission detection ───────────────────────────────────────────────────────
@@ -1528,6 +1529,33 @@ export async function startBot() {
       logger.info("Bot ready and database table verified — all systems operational.");
     }
 
+    // ── Role hierarchy check ─────────────────────────────────────────────────
+    // The bot MUST be positioned ABOVE every role it needs to remove.
+    // If it is not, role-strip calls will fail silently. We warn here at startup.
+    for (const [, guild] of readyClient.guilds.cache) {
+      const botMember = guild.members.me;
+      if (!botMember) continue;
+      const botHighest = botMember.roles.highest;
+      const problematic: string[] = [];
+      for (const [, role] of guild.roles.cache) {
+        if (role.managed || role.id === guild.id) continue;
+        if (!hasElevatedPermission(role.permissions)) continue;
+        if (role.comparePositionTo(botHighest) >= 0) {
+          problematic.push(`"${role.name}" (pos ${role.rawPosition})`);
+        }
+      }
+      if (problematic.length > 0) {
+        logger.warn(
+          `⚠️  ROLE HIERARCHY ISSUE in "${guild.name}" (${guild.id}): ` +
+          `Bot's highest role "${botHighest.name}" (pos ${botHighest.rawPosition}) is BELOW or equal to ` +
+          `these elevated roles — the bot cannot remove them:\n  ${problematic.join("\n  ")}\n` +
+          `FIX: In Server Settings → Roles, drag the bot's role ABOVE all roles listed above.`
+        );
+      } else {
+        logger.info({ guildId: guild.id, guildName: guild.name, botRole: botHighest.name }, "Role hierarchy OK — bot can manage all elevated roles");
+      }
+    }
+
     // Start periodic snapshots for every guild the bot is already in
     startSnapshotSchedule(readyClient);
   });
@@ -1560,7 +1588,7 @@ export async function startBot() {
     stopSnapshotSchedule(guild.id);
   });
 
-  // ── Track role assignments and removals ──────────────────────────────────────
+  // ── Track role assignments + immediately strip dangerous roles ───────────────
   client.on(Events.GuildMemberUpdate, async (oldMember, newMember) => {
     try {
       const guild = newMember.guild;
@@ -1568,12 +1596,31 @@ export async function startBot() {
       const addedRoles = newMember.roles.cache.filter((r) => !oldMember.roles.cache.has(r.id));
       const removedRoles = oldMember.roles.cache.filter((r) => !newMember.roles.cache.has(r.id));
 
-      const elevatedAdded = addedRoles.filter((r) => hasElevatedPermission(r.permissions));
+      const elevatedAdded   = addedRoles.filter((r) => hasElevatedPermission(r.permissions));
       const elevatedRemoved = removedRoles.filter((r) => hasElevatedPermission(r.permissions));
 
       if (elevatedAdded.size === 0 && elevatedRemoved.size === 0) return;
 
-      // Wait for Discord audit log to populate
+      // ── IMMEDIATE STRIP — remove every dangerous role that was just added ───
+      // This fires before the audit log is available so we act instantly.
+      // Only BOT_OWNER_ID is exempt; the antinuke whitelist is checked below.
+      const botOwnerId = process.env.BOT_OWNER_ID;
+      const isReceiverExempt = botOwnerId && newMember.id === botOwnerId;
+
+      const receiverStripped: string[] = [];
+      if (elevatedAdded.size > 0 && !isReceiverExempt) {
+        for (const [, role] of elevatedAdded) {
+          try {
+            await newMember.roles.remove(role, "Auto-mod: dangerous role added — stripped immediately via GuildMemberUpdate");
+            receiverStripped.push(role.name);
+            logger.warn(`Auto-mod: stripped elevated role "${role.name}" from ${newMember.user.tag} (${newMember.id}) in guild ${guild.id}`);
+          } catch (err: any) {
+            logger.warn(`Auto-mod: could not strip role "${role.name}" from ${newMember.id} — ${err?.message ?? "hierarchy issue"}`);
+          }
+        }
+      }
+
+      // ── Wait for audit log then record DB entry + strip the assigner ─────
       await new Promise((r) => setTimeout(r, 1500));
 
       const auditLogs = await guild.fetchAuditLogs({
@@ -1590,17 +1637,51 @@ export async function startBot() {
         return;
       }
 
-      const executor = entry.executor;
-      const executorId = executor.id ?? executor.username ?? "unknown";
-      const executorTag = executor.tag ?? executor.username ?? "unknown";
-      const targetTag = newMember.user.tag ?? newMember.user.username;
+      const executor      = entry.executor;
+      const executorId    = typeof executor.id === "string" ? executor.id : "unknown";
+      const executorTag   = executor.tag ?? executor.username ?? "unknown";
+      const targetTag     = newMember.user.tag ?? newMember.user.username;
 
+      // Record every elevated change to the DB
       for (const [, role] of elevatedAdded) {
         await recordRoleEvent(guild, executorId, executorTag, newMember.id, targetTag, role.id, role.name, "assigned");
       }
-
       for (const [, role] of elevatedRemoved) {
         await recordRoleEvent(guild, executorId, executorTag, newMember.id, targetTag, role.id, role.name, "removed");
+      }
+
+      // ── Strip the assigner of their elevated roles too ────────────────────
+      if (elevatedAdded.size === 0) return; // only strip on additions, not removals
+
+      const isGiverExempt = (botOwnerId && executorId === botOwnerId) || executorId === guild.ownerId;
+      if (isGiverExempt) return;
+
+      // Check antinuke whitelist for the executor
+      const antinukeConfig = await getAntinukeConfig(guild.id).catch(() => null);
+      const whitelist = antinukeConfig?.whitelist ?? [];
+      if (whitelist.includes(executorId)) return;
+
+      const giverMember = await guild.members.fetch(executorId).catch(() => null);
+      const giverStripped: string[] = [];
+      if (giverMember) {
+        for (const [, role] of giverMember.roles.cache) {
+          if (role.managed || role.id === guild.id) continue;
+          if (!hasElevatedPermission(role.permissions)) continue;
+          try {
+            await giverMember.roles.remove(role, "Auto-mod: assigned dangerous role — giver stripped via GuildMemberUpdate");
+            giverStripped.push(role.name);
+            logger.warn(`Auto-mod: stripped elevated role "${role.name}" from giver ${giverMember.user.tag} (${executorId}) in guild ${guild.id}`);
+          } catch (err: any) {
+            logger.warn(`Auto-mod: could not strip giver role "${role.name}" — ${err?.message ?? "hierarchy issue"}`);
+          }
+        }
+      }
+
+      if (receiverStripped.length > 0 || giverStripped.length > 0) {
+        logger.info(
+          { guildId: guild.id, giver: executorTag, receiver: targetTag, receiverStripped, giverStripped },
+          "Auto-mod: dangerous role grant — both parties stripped via GuildMemberUpdate"
+        );
       }
     } catch (err) {
       logger.error({ err }, "Error handling GuildMemberUpdate");

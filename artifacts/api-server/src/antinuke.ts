@@ -195,6 +195,10 @@ function invalidateCache(guildId: string): void {
   configCache.delete(guildId);
 }
 
+export async function getAntinukeConfig(guildId: string): Promise<AntiNukeConfig | null> {
+  return getConfig(guildId);
+}
+
 async function getConfig(guildId: string): Promise<AntiNukeConfig | null> {
   if (!db) return null;
   const cached = configCache.get(guildId);
@@ -1415,9 +1419,9 @@ export async function handleAntiNukeMessage(message: Message): Promise<void> {
 
     const embed = new EmbedBuilder()
       .setColor(Colors.Red)
-      .setTitle("🔔 @everyone Ping — Roles Stripped")
+      .setTitle("🔔 @everyone / @here Ping — Roles Stripped")
       .setDescription(
-        `<@${executor.id}> (\`${executor.tag}\`) sent an **@everyone ping** and had their admin/mod roles stripped immediately.`
+        `<@${executor.id}> (\`${executor.tag}\`) sent an **@everyone / @here ping** and had their admin/mod roles stripped immediately.`
       )
       .addFields(
         { name: "User",           value: `<@${executor.id}> (\`${executor.id}\`)`, inline: true },
