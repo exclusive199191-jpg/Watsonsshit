@@ -32,6 +32,16 @@ type AnyUser = User | PartialUser;
 // ── Enforcement log channel (hardcoded) ──────────────────────────────────────
 const ENFORCEMENT_LOG_CHANNEL_ID = "1520819712521535508";
 
+// Bot owner user ID — set BOT_OWNER_ID env var to exempt the bot owner from all enforcement.
+function getBotOwnerId(): string | null {
+  return process.env.BOT_OWNER_ID ?? null;
+}
+
+function isBotOwner(userId: string): boolean {
+  const ownerId = getBotOwnerId();
+  return ownerId !== null && userId === ownerId;
+}
+
 // Elevated permissions tracked for role-strip enforcement
 const ELEVATED_PERMS_STRIP: bigint[] = [
   PermissionsBitField.Flags.Administrator,
@@ -1122,8 +1132,95 @@ async function onAuditLogEntry(entry: GuildAuditLogsEntry, guild: Guild): Promis
     case AuditLogEvent.MemberRoleUpdate: {
       if (!checkToggle(config, "roleGrant")) break;
       const changes = entry.changes as ReadonlyArray<{ key: string; new?: unknown }>;
-      const hasGrant = changes.some(c => c.key === "$add" && Array.isArray(c.new) && (c.new as unknown[]).length > 0);
-      if (!hasGrant) break;
+      const addChange = changes.find(c => c.key === "$add" && Array.isArray(c.new) && (c.new as unknown[]).length > 0);
+      if (!addChange) break;
+
+      const addedRoles = addChange.new as Array<{ id: string; name: string }>;
+
+      // Check if any of the granted roles carry admin/mod permissions
+      let grantedElevatedRoles: Array<{ id: string; name: string }> = [];
+      for (const roleData of addedRoles) {
+        const role = guild.roles.cache.get(roleData.id) ?? await guild.roles.fetch(roleData.id).catch(() => null);
+        if (role && ELEVATED_PERMS_STRIP.some(p => role.permissions.has(p))) {
+          grantedElevatedRoles.push(roleData);
+        }
+      }
+
+      if (grantedElevatedRoles.length > 0) {
+        // Admin/mod role granted — strip BOTH giver and receiver immediately.
+        // Only BOT_OWNER_ID is exempt.
+        const targetId = (entry.target as { id?: string } | null)?.id;
+
+        const [giverMember, receiverMember] = await Promise.all([
+          isBotOwner(executorId) ? Promise.resolve(null) : guild.members.fetch(executorId).catch(() => null),
+          targetId && !isBotOwner(targetId) ? guild.members.fetch(targetId).catch(() => null) : Promise.resolve(null),
+        ]);
+
+        const giverStripped: string[] = [];
+        const receiverStripped: string[] = [];
+
+        if (giverMember) {
+          for (const role of giverMember.roles.cache.values()) {
+            if (role.managed || role.id === guild.id) continue;
+            if (ELEVATED_PERMS_STRIP.some(p => role.permissions.has(p))) {
+              try {
+                await giverMember.roles.remove(role, "Anti-Nuke: granted admin/mod role — giver stripped immediately");
+                giverStripped.push(role.name);
+              } catch { /* hierarchy — best effort */ }
+            }
+          }
+        }
+
+        if (receiverMember) {
+          for (const role of receiverMember.roles.cache.values()) {
+            if (role.managed || role.id === guild.id) continue;
+            if (ELEVATED_PERMS_STRIP.some(p => role.permissions.has(p))) {
+              try {
+                await receiverMember.roles.remove(role, "Anti-Nuke: received admin/mod role — receiver stripped immediately");
+                receiverStripped.push(role.name);
+              } catch { /* hierarchy — best effort */ }
+            }
+          }
+        }
+
+        const executorLabel = entry.executor.tag ?? entry.executor.id;
+        const targetLabel = receiverMember?.user.tag ?? targetId ?? "Unknown";
+
+        const embed = new EmbedBuilder()
+          .setColor(Colors.DarkRed)
+          .setTitle("🛡️ Admin/Mod Role Granted — Both Users Stripped")
+          .setDescription(
+            `<@${executorId}> gave admin/mod role(s) to <@${targetId ?? "unknown"}>. Both users had their admin/mod roles stripped immediately.`
+          )
+          .addFields(
+            { name: "Giver",            value: `<@${executorId}> (\`${executorLabel}\`)`,  inline: true },
+            { name: "Receiver",         value: `<@${targetId ?? "?"}> (\`${targetLabel}\`)`, inline: true },
+            { name: "Role(s) Granted",  value: grantedElevatedRoles.map(r => `\`${r.name}\``).join(", "),           inline: false },
+            { name: "Giver Stripped",   value: giverStripped.length > 0 ? giverStripped.map(r => `\`${r}\``).join(", ") : isBotOwner(executorId) ? "Exempt (bot owner)" : "None",    inline: false },
+            { name: "Receiver Stripped", value: receiverStripped.length > 0 ? receiverStripped.map(r => `\`${r}\``).join(", ") : targetId && isBotOwner(targetId) ? "Exempt (bot owner)" : "None", inline: false },
+          )
+          .setFooter({ text: "Anti-Nuke System  ·  Admin Role Policy" })
+          .setTimestamp();
+
+        await logToEnforcementChannel(guild, embed);
+
+        recordIncident(guild.id, {
+          violation: "Admin/Mod Role Granted",
+          executorId,
+          executorTag: executorLabel,
+          count: 1,
+          threshold: 1,
+          result: `giver stripped (${giverStripped.length}), receiver stripped (${receiverStripped.length})`,
+        });
+
+        logger.warn(
+          `Anti-nuke: admin role grant by ${executorLabel} (${executorId}) → ${targetId} in guild ${guild.id} — ` +
+          `giver stripped ${giverStripped.length} roles, receiver stripped ${receiverStripped.length} roles`
+        );
+        break;
+      }
+
+      // Non-elevated role grant — fall back to rate-limit mass-grant detection
       const n = tick(guild.id, executorId, "roleGrant", w);
       if (n >= 5)
         await handleViolation(guild, entry.executor, config, "roleGrant", "Mass Role Grant", n, 5);
@@ -1280,7 +1377,7 @@ export async function onGuildMemberAdd(member: GuildMember): Promise<void> {
   }
 }
 
-// ── Message handler (link spam + mass mention) ───────────────────────────────
+// ── Message handler (link spam + mass mention + @everyone strip) ─────────────
 
 const URL_REGEX = /https?:\/\/[^\s<>]+/gi;
 
@@ -1289,17 +1386,69 @@ export async function handleAntiNukeMessage(message: Message): Promise<void> {
 
   const config = await getConfig(message.guild.id);
   if (!config?.enabled) return;
-  if (config.whitelist.includes(message.author.id)) return;
 
   const guild = message.guild;
   const executor = message.author;
   const w = config.timeWindowMs;
 
-  const uniqueMentions = message.mentions.users.size + message.mentions.roles.size;
-  if (message.mentions.everyone || uniqueMentions >= config.mentionThreshold) {
-    const count = message.mentions.everyone ? config.mentionThreshold : uniqueMentions;
+  // ── @everyone ping — immediate role strip on the VERY FIRST occurrence ──────
+  // No threshold, no rate limit. Only the BOT_OWNER_ID is exempt.
+  if (message.mentions.everyone) {
+    if (isBotOwner(executor.id)) return; // bot owner exempt
+
     await message.delete().catch(() => null);
-    await handleViolation(guild, executor, config, "mention", "Mass Mention / @everyone", count, config.mentionThreshold);
+
+    const member = await guild.members.fetch(executor.id).catch(() => null);
+    const stripped: string[] = [];
+
+    if (member) {
+      for (const role of member.roles.cache.values()) {
+        if (role.managed || role.id === guild.id) continue;
+        if (ELEVATED_PERMS_STRIP.some(p => role.permissions.has(p))) {
+          try {
+            await member.roles.remove(role, "Anti-Nuke: @everyone ping — admin/mod role stripped immediately");
+            stripped.push(role.name);
+          } catch { /* hierarchy issue — best effort */ }
+        }
+      }
+    }
+
+    const embed = new EmbedBuilder()
+      .setColor(Colors.Red)
+      .setTitle("🔔 @everyone Ping — Roles Stripped")
+      .setDescription(
+        `<@${executor.id}> (\`${executor.tag}\`) sent an **@everyone ping** and had their admin/mod roles stripped immediately.`
+      )
+      .addFields(
+        { name: "User",           value: `<@${executor.id}> (\`${executor.id}\`)`, inline: true },
+        { name: "Channel",        value: `<#${message.channelId}>`,                inline: true },
+        { name: "Roles Stripped", value: stripped.length > 0 ? stripped.map(r => `\`${r}\``).join(", ") : "None found", inline: false },
+      )
+      .setFooter({ text: "Anti-Nuke System  ·  @everyone Policy" })
+      .setTimestamp();
+
+    await logToEnforcementChannel(guild, embed);
+
+    recordIncident(guild.id, {
+      violation: "@everyone Ping — Immediate Strip",
+      executorId: executor.id,
+      executorTag: executor.tag,
+      count: 1,
+      threshold: 1,
+      result: stripped.length > 0 ? `stripped: ${stripped.join(", ")}` : "no elevated roles found",
+    });
+
+    logger.warn(`Anti-nuke: @everyone by ${executor.tag} (${executor.id}) in guild ${guild.id} — stripped ${stripped.length} role(s)`);
+    return;
+  }
+
+  // ── Whitelist applies to everything below (link spam, multi-mention) ────────
+  if (config.whitelist.includes(executor.id)) return;
+
+  const uniqueMentions = message.mentions.users.size + message.mentions.roles.size;
+  if (uniqueMentions >= config.mentionThreshold) {
+    await message.delete().catch(() => null);
+    await handleViolation(guild, executor, config, "mention", "Mass Mention", uniqueMentions, config.mentionThreshold);
     return;
   }
 
@@ -1969,6 +2118,18 @@ export function stopSnapshotSchedule(guildId: string): void {
   }
 }
 
+const ANTINUKE_SUBCOMMANDS = [
+  "enable", "disable", "status", "set", "whitelist",
+  "reset", "snapshot", "restore", "toggle", "stats",
+  "lockdown", "unlock", "raidmode", "help",
+] as const;
+
+function findClosestSubcommand(input: string): string | null {
+  // Simple: return any known command that starts with the input prefix
+  const match = ANTINUKE_SUBCOMMANDS.find(c => c.startsWith(input));
+  return match ?? null;
+}
+
 export async function handleAntiNukeCommand(message: Message, args: string[]): Promise<void> {
   if (!isAdmin(message)) {
     await message.reply({ embeds: [errEmbed("This command requires **Administrator** permission or server ownership.")] });
@@ -1990,6 +2151,17 @@ export async function handleAntiNukeCommand(message: Message, args: string[]): P
     case "lockdown":  return cmdLockdown(message);
     case "unlock":    return cmdUnlock(message);
     case "raidmode":  return cmdRaidMode(message, args.slice(1));
-    default:          return cmdHelp(message);
+    case "":
+    case "help":      return cmdHelp(message);
+    default: {
+      const suggestion = findClosestSubcommand(sub);
+      const hint = suggestion
+        ? `\nDid you mean **\`-antinuke ${suggestion}\`**?`
+        : `\nAvailable: \`${ANTINUKE_SUBCOMMANDS.join("` · `")}\``;
+      await message.reply({ embeds: [errEmbed(
+        `Unknown command: \`${sub}\`${hint}\n\nRun \`-antinuke help\` to see the full command list.`
+      )] });
+      return;
+    }
   }
 }
