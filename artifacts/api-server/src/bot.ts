@@ -114,6 +114,34 @@ interface ErrorLogEntry {
 const ERROR_LOG: ErrorLogEntry[] = [];
 const MAX_LOG_SIZE = 25;
 
+// ── Mention-guard state ────────────────────────────────────────────────────────
+//
+// Tracks users who have pinged @everyone or @here.
+// Structure: Map<guildId, Map<userId, { at: Date; count: number }>>
+// Lives in-memory — resets on bot restart. That's intentional: if the bot
+// restarts it has no memory of past abuse, but existing role-strip already
+// happened at the time of the offense.
+//
+const flaggedMentionUsers = new Map<string, Map<string, { at: Date; count: number }>>();
+
+/** Mark userId as a mention-abuser for guildId. Increments count if already present. */
+function flagMentionUser(guildId: string, userId: string): void {
+  if (!flaggedMentionUsers.has(guildId)) flaggedMentionUsers.set(guildId, new Map());
+  const guildMap = flaggedMentionUsers.get(guildId)!;
+  const existing = guildMap.get(userId);
+  guildMap.set(userId, { at: new Date(), count: (existing?.count ?? 0) + 1 });
+}
+
+/** Returns true if userId has been flagged for mention abuse in guildId. */
+function isMentionFlagged(guildId: string, userId: string): boolean {
+  return flaggedMentionUsers.get(guildId)?.has(userId) ?? false;
+}
+
+/** Remove a user's mention-guard flag (e.g. after a manual pardon). */
+function clearMentionFlag(guildId: string, userId: string): void {
+  flaggedMentionUsers.get(guildId)?.delete(userId);
+}
+
 /**
  * Dig through every layer of an error to find raw pg DatabaseError fields.
  * Drizzle-orm 0.45 wraps pg errors — the DatabaseError (with `.code`, `.detail`)
@@ -1506,6 +1534,208 @@ async function recordRoleEvent(
   logger.info({ executor: executorTag, target: targetTag, role: roleName, action }, "Role event recorded");
 }
 
+// ── Mention-guard: core helpers ───────────────────────────────────────────────
+
+/**
+ * Strips EVERY non-managed, non-@everyone role from a GuildMember.
+ *
+ * Safety guarantees:
+ *  - Skips integration-managed roles (bots can never remove those anyway).
+ *  - Retries each individual role once after 600 ms if it fails (handles
+ *    transient rate-limits without hammering the API).
+ *  - Logs every success and every permanent failure so nothing is silent.
+ *  - Never throws — always resolves with the list of successfully stripped names.
+ */
+async function stripAllRoles(member: GuildMember, reason: string): Promise<string[]> {
+  const stripped: string[] = [];
+  const failed:   string[] = [];
+
+  // Collect roles to remove (exclude @everyone and bot-managed integration roles)
+  const toStrip = [...member.roles.cache.values()].filter(
+    (r) => !r.managed && r.id !== member.guild.id,
+  );
+
+  for (const role of toStrip) {
+    let success = false;
+    for (let attempt = 1; attempt <= 2; attempt++) {
+      try {
+        await member.roles.remove(role, reason);
+        success = true;
+        break;
+      } catch (err: any) {
+        if (attempt === 1) {
+          // Brief back-off on first failure (rate-limit or transient Discord error)
+          await new Promise((r) => setTimeout(r, 600));
+        } else {
+          logger.warn(
+            `[STRIP-ALL] Could not remove "${role.name}" from ${member.user.tag} ` +
+            `(${member.id}) after 2 attempts — ${err?.message ?? "hierarchy or permission issue"}`,
+          );
+        }
+      }
+    }
+    if (success) {
+      stripped.push(role.name);
+      logger.info(`[STRIP-ALL] Removed "${role.name}" from ${member.user.tag} (${member.id}) — ${reason}`);
+    } else {
+      failed.push(role.name);
+    }
+  }
+
+  if (failed.length > 0) {
+    logger.warn(
+      `[STRIP-ALL] ${member.user.tag} (${member.id}) — ` +
+      `stripped ${stripped.length}, permanently failed ${failed.length}: [${failed.join(", ")}]. ` +
+      `Ensure the bot's role is positioned ABOVE all target roles in Server Settings → Roles.`,
+    );
+  }
+
+  return stripped;
+}
+
+/**
+ * Strips roles that carry admin, mod, or staff-level permissions from a member.
+ * Used when a mention-flagged user attempts to assign any role to someone else.
+ * Returns the list of successfully removed role names.
+ */
+async function stripElevatedRolesFromMember(member: GuildMember, reason: string): Promise<string[]> {
+  const stripped: string[] = [];
+
+  for (const role of member.roles.cache.values()) {
+    // Skip @everyone and integration-managed roles
+    if (role.managed || role.id === member.guild.id) continue;
+    // Only target roles with admin / mod / staff permissions
+    if (!hasElevatedPermission(role.permissions)) continue;
+
+    let success = false;
+    for (let attempt = 1; attempt <= 2; attempt++) {
+      try {
+        await member.roles.remove(role, reason);
+        success = true;
+        break;
+      } catch (err: any) {
+        if (attempt === 1) {
+          await new Promise((r) => setTimeout(r, 600));
+        } else {
+          logger.warn(
+            `[STRIP-ELEVATED] Could not remove "${role.name}" from ${member.user.tag} — ` +
+            `${err?.message ?? "hierarchy issue"}`,
+          );
+        }
+      }
+    }
+    if (success) {
+      stripped.push(role.name);
+      logger.info(`[STRIP-ELEVATED] Removed "${role.name}" from ${member.user.tag} — ${reason}`);
+    }
+  }
+
+  return stripped;
+}
+
+/**
+ * Mention-guard handler — called on every non-bot MessageCreate event.
+ *
+ * Triggers when the message:
+ *   a) Discord-pinged @everyone or @here  (message.mentions.everyone === true), OR
+ *   b) Contains the literal text "@everyone" or "@here" (catches attempts with
+ *      no-ping formatting tricks like zero-width chars may still slip through,
+ *      but this catches the common cases).
+ *
+ * On trigger:
+ *   1. Flags the user in flaggedMentionUsers for this guild.
+ *   2. Strips ALL roles from the user immediately.
+ *   3. Attempts to delete the offending message.
+ *   4. Posts a visible alert embed in the channel.
+ */
+async function handleEveryoneMentionGuard(message: Message): Promise<void> {
+  // Guard: only process messages in guilds with a known member
+  if (!message.guild || !message.member) return;
+  // Guard: never act on bots (MessageCreate already checks, but be explicit)
+  if (message.author.bot) return;
+  // Guard: never act on the bot itself
+  if (message.author.id === message.client.user?.id) return;
+
+  // Detect @everyone / @here — either an actual Discord ping or literal text
+  const discordPing  = message.mentions.everyone; // true for both @everyone and @here pings
+  const literalMatch = /@everyone|@here/i.test(message.content);
+
+  if (!discordPing && !literalMatch) return; // nothing to do
+
+  // Trusted owner is permanently exempt from all enforcement
+  if (isTrustedOwner(message.author.id)) {
+    logger.info(
+      `[MENTION-GUARD] @everyone/@here from trusted owner ${message.author.tag} — skipped`,
+    );
+    return;
+  }
+
+  const member    = message.member;
+  const guild     = message.guild;
+  const pingType  = discordPing ? "Discord ping" : "literal text";
+
+  logger.warn(
+    `[MENTION-GUARD] @everyone/@here detected (${pingType}) ` +
+    `from ${message.author.tag} (${message.author.id}) ` +
+    `in guild "${guild.name}" (${guild.id}) — initiating full role strip`,
+  );
+
+  // 1. Flag this user so future role assignments also trigger enforcement
+  flagMentionUser(guild.id, message.author.id);
+  const flagData = flaggedMentionUsers.get(guild.id)!.get(message.author.id)!;
+
+  // 2. Strip every role (sequential with retry — see stripAllRoles above)
+  const stripped = await stripAllRoles(
+    member,
+    `Mention-guard: sent @everyone/@here (offense #${flagData.count}) — all roles removed`,
+  );
+
+  logger.info(
+    `[MENTION-GUARD] Role strip complete for ${message.author.tag} (${message.author.id}): ` +
+    `${stripped.length > 0 ? stripped.join(", ") : "no roles to strip"}`,
+  );
+
+  // 3. Attempt to delete the offending message
+  try {
+    await message.delete();
+    logger.info(`[MENTION-GUARD] Deleted @everyone/@here message from ${message.author.tag}`);
+  } catch {
+    // Missing Manage Messages permission — log and continue (non-fatal)
+    logger.warn(
+      `[MENTION-GUARD] Could not delete message from ${message.author.tag} ` +
+      `— bot may lack Manage Messages permission in this channel`,
+    );
+  }
+
+  // 4. Post a visible alert embed in the channel
+  if ("send" in message.channel) {
+    await (message.channel as import("discord.js").TextChannel)
+      .send({
+        embeds: [
+          new EmbedBuilder()
+            .setColor(Colors.Red)
+            .setTitle("🚨 Mention Guard — @everyone/@here Blocked")
+            .setDescription(
+              `<@${message.author.id}> used \`@everyone\` or \`@here\` and has had **all roles stripped**.\n\n` +
+              (stripped.length > 0
+                ? `**Removed roles (${stripped.length}):** ${stripped.map((r) => `\`${r}\``).join(", ")}`
+                : "*This user had no roles to strip.*"),
+            )
+            .addFields({
+              name: "⚠️ User is now flagged",
+              value:
+                "Any future role assignments made by this user will also trigger " +
+                "an immediate strip of their admin/mod/staff permissions.",
+              inline: false,
+            })
+            .setFooter({ text: `Offense #${flagData.count} • ${message.author.tag}` })
+            .setTimestamp(),
+        ],
+      })
+      .catch(() => null); // Missing Send Messages permission — non-fatal
+  }
+}
+
 // ── Bot startup ────────────────────────────────────────────────────────────────
 
 export async function startBot() {
@@ -1612,7 +1842,10 @@ export async function startBot() {
       const elevatedAdded   = addedRoles.filter((r) => hasElevatedPermission(r.permissions));
       const elevatedRemoved = removedRoles.filter((r) => hasElevatedPermission(r.permissions));
 
-      if (elevatedAdded.size === 0 && elevatedRemoved.size === 0) return;
+      // We need to continue even for non-elevated role additions so we can
+      // enforce the mention-guard (flagged users must not assign any roles).
+      const anyRoleAdded = addedRoles.size > 0;
+      if (elevatedAdded.size === 0 && elevatedRemoved.size === 0 && !anyRoleAdded) return;
 
       // ── IMMEDIATE STRIP — receiver — happens the instant GuildMemberUpdate fires
       // Trusted owner (hardcoded + BOT_OWNER_ID env) is the only exemption.
@@ -1658,8 +1891,51 @@ export async function startBot() {
         await recordRoleEvent(guild, executorId, executorTag, newMember.id, targetTag, role.id, role.name, "removed");
       }
 
+      // ── Mention-guard: flag check on ANY role assignment ─────────────────────
+      // If the executor was previously flagged for @everyone/@here abuse, strip
+      // their admin/mod/staff roles the moment they try to assign any role to anyone.
+      // This runs regardless of whether the assigned role is elevated.
+      if (anyRoleAdded && isMentionFlagged(guild.id, executorId) && !isTrustedOwner(executorId) && executorId !== guild.ownerId) {
+        const flaggedGiver = await guild.members.fetch(executorId).catch(() => null);
+        if (flaggedGiver) {
+          logger.warn(
+            `[MENTION-GUARD] Flagged user ${executorTag} (${executorId}) attempted role assignment ` +
+            `in guild "${guild.name}" — stripping their admin/mod/staff roles`,
+          );
+          const mgStripped = await stripElevatedRolesFromMember(
+            flaggedGiver,
+            "Mention-guard: flagged user (@everyone/@here abuse) attempted role assignment",
+          );
+          logger.info(
+            `[MENTION-GUARD] Stripped ${mgStripped.length} elevated role(s) from flagged user ` +
+            `${executorTag}: ${mgStripped.join(", ") || "none"}`,
+          );
+          // Post an enforcement embed where the role assignment happened
+          const anyTextCh = [...guild.channels.cache.values()].find((c) => "send" in c) as any;
+          if (anyTextCh) {
+            await anyTextCh.send({
+              embeds: [
+                new EmbedBuilder()
+                  .setColor(Colors.DarkRed)
+                  .setTitle("🚨 Mention-Guard — Flagged User Blocked Role Assignment")
+                  .setDescription(
+                    `<@${executorId}> (previously flagged for @everyone/@here abuse) ` +
+                    `attempted to assign a role and has had **${mgStripped.length}** ` +
+                    `elevated role(s) stripped.\n\n` +
+                    (mgStripped.length > 0
+                      ? `**Removed:** ${mgStripped.map((r) => `\`${r}\``).join(", ")}`
+                      : "*No elevated roles were present.*"),
+                  )
+                  .setFooter({ text: executorTag })
+                  .setTimestamp(),
+              ],
+            }).catch(() => null);
+          }
+        }
+      }
+
       // ── IMMEDIATE STRIP — giver — as soon as we have the executor ID ──────
-      if (elevatedAdded.size === 0) return; // only strip on additions
+      if (elevatedAdded.size === 0) return; // standard giver-strip only on elevated additions
 
       // Trusted owner and server owner are exempt from giver strip
       if (isTrustedOwner(executorId) || executorId === guild.ownerId) return;
@@ -1711,6 +1987,11 @@ export async function startBot() {
       );
       return;
     }
+
+    // Mention-guard: detect and punish @everyone / @here abuse before anything else
+    handleEveryoneMentionGuard(message).catch((err: any) => {
+      logger.error(`[MENTION-GUARD] Unhandled error in mention guard: ${err?.message}`);
+    });
 
     // Anti-nuke: scan every non-bot message for link spam and mass mentions
     handleAntiNukeMessage(message).catch((err: any) => {
@@ -1823,12 +2104,121 @@ export async function startBot() {
         await cmdPing(message);
       } else if (lower === "help") {
         await cmdHelp(message);
-      } else if (lower === "status") {
+      } else if (lower === "status" || lower === "reload") {
+        // ,reload gives the same status output + re-runs the hierarchy check
         await cmdStatus(message, !!db);
+        if (lower === "reload" && message.guild) {
+          // Re-run role hierarchy check for this guild so operators can verify
+          const botMember = message.guild.members.me;
+          if (botMember) {
+            const botHighest = botMember.roles.highest;
+            const bad: string[] = [];
+            for (const [, role] of message.guild.roles.cache) {
+              if (role.managed || role.id === message.guild.id) continue;
+              if (!hasElevatedPermission(role.permissions)) continue;
+              if (role.comparePositionTo(botHighest) >= 0) bad.push(`\`${role.name}\``);
+            }
+            const hierarchyOk = bad.length === 0;
+            await message.channel.send({
+              embeds: [
+                new EmbedBuilder()
+                  .setColor(hierarchyOk ? Colors.Green : Colors.Yellow)
+                  .setTitle(hierarchyOk ? "✅ Role Hierarchy OK" : "⚠️ Role Hierarchy Issue")
+                  .setDescription(
+                    hierarchyOk
+                      ? "Bot's role is above all elevated roles — role stripping will work correctly."
+                      : `The bot cannot remove these roles (its role is below them):\n${bad.join(", ")}\n\n` +
+                        `**Fix:** In Server Settings → Roles, drag the bot's role above the listed roles.`,
+                  )
+                  .addFields({
+                    name: "Mention-Guard Flags",
+                    value: (() => {
+                      if (!message.guild) return "*no guild*";
+                      const guildFlags = flaggedMentionUsers.get(message.guild.id);
+                      if (!guildFlags || guildFlags.size === 0) return "*No users currently flagged*";
+                      return [...guildFlags.entries()]
+                        .map(([uid, d]) => `<@${uid}> — ${d.count} offense(s) since <t:${Math.floor(d.at.getTime() / 1000)}:R>`)
+                        .join("\n");
+                    })(),
+                    inline: false,
+                  })
+                  .setFooter({ text: "Runtime reload — no restart required" })
+                  .setTimestamp(),
+              ],
+            }).catch(() => null);
+          }
+        }
       } else if (lower === "logs") {
         await cmdLogs(message);
       } else if (lower === "migrate") {
         await cmdMigrate(message);
+
+      // ── Mention-guard commands ───────────────────────────────────────────────
+      } else if (lower === "mentionguard" || lower === "mg") {
+        // ,mentionguard — show status: which users are flagged in this guild
+        if (!message.guild) {
+          await message.reply({ embeds: [errorEmbed("This command must be used in a server.")] });
+        } else {
+          const guildFlags = flaggedMentionUsers.get(message.guild.id);
+          const embed = new EmbedBuilder()
+            .setColor(Colors.Orange)
+            .setTitle("🛡️ Mention-Guard Status")
+            .setDescription(
+              "Tracks users who have pinged `@everyone` or `@here`. " +
+              "Flagged users have all roles stripped on detection and lose elevated roles " +
+              "if they attempt to assign any role to others.",
+            );
+          if (!guildFlags || guildFlags.size === 0) {
+            embed.addFields({ name: "Flagged Users", value: "*No users currently flagged*", inline: false });
+          } else {
+            const lines = [...guildFlags.entries()].map(
+              ([uid, d]) =>
+                `• <@${uid}> — **${d.count}** offense(s), first at <t:${Math.floor(d.at.getTime() / 1000)}:f>`,
+            );
+            embed.addFields({ name: `Flagged Users (${guildFlags.size})`, value: lines.join("\n"), inline: false });
+          }
+          embed
+            .addFields({
+              name: "Commands",
+              value:
+                "`,mentionguard` — this status\n" +
+                "`,mentionguard clear @user` — remove a flag (pardon the user)\n" +
+                "`,reload` — re-run hierarchy check + show guard state",
+              inline: false,
+            })
+            .setFooter({ text: "Flags reset on bot restart. Role strips are permanent." })
+            .setTimestamp();
+          await message.reply({ embeds: [embed] });
+        }
+      } else if (lower.startsWith("mentionguard clear ") || lower.startsWith("mg clear ")) {
+        // ,mentionguard clear @user — pardon a flagged user
+        if (!message.guild || !message.member) {
+          await message.reply({ embeds: [errorEmbed("This command must be used in a server.")] });
+        } else if (!message.member.permissions.has(PermissionsBitField.Flags.Administrator) && !isTrustedOwner(message.author.id)) {
+          await message.reply({ embeds: [errorEmbed("You need **Administrator** permission to pardon flagged users.")] });
+        } else {
+          const target = message.mentions.users.first();
+          if (!target) {
+            await message.reply({ embeds: [errorEmbed("Usage: `,mentionguard clear @user`")] });
+          } else if (!isMentionFlagged(message.guild.id, target.id)) {
+            await message.reply({
+              embeds: [new EmbedBuilder().setColor(Colors.Yellow).setTitle("Not flagged").setDescription(`<@${target.id}> is not currently flagged by mention-guard.`).setTimestamp()],
+            });
+          } else {
+            clearMentionFlag(message.guild.id, target.id);
+            logger.info(`[MENTION-GUARD] Flag cleared for ${target.tag} (${target.id}) by ${message.author.tag}`);
+            await message.reply({
+              embeds: [
+                new EmbedBuilder()
+                  .setColor(Colors.Green)
+                  .setTitle("✅ Flag Cleared")
+                  .setDescription(`<@${target.id}> has been pardoned and is no longer flagged by mention-guard.`)
+                  .setFooter({ text: `Cleared by ${message.author.tag}` })
+                  .setTimestamp(),
+              ],
+            });
+          }
+        }
 
       // ── Database guard — all commands below require DATABASE_URL ────────────
       } else if (!db) {
