@@ -89,6 +89,7 @@ export async function runMigrations() {
       await client.query(`ALTER TABLE antinuke_config ADD COLUMN IF NOT EXISTS raid_join_threshold INT NOT NULL DEFAULT 10`);
       await client.query(`ALTER TABLE antinuke_config ADD COLUMN IF NOT EXISTS raid_join_window_ms INT NOT NULL DEFAULT 30000`);
       await client.query(`ALTER TABLE antinuke_config ADD COLUMN IF NOT EXISTS emergency_mode BOOLEAN NOT NULL DEFAULT FALSE`);
+      await client.query(`ALTER TABLE antinuke_config ADD COLUMN IF NOT EXISTS roleing_exempt TEXT NOT NULL DEFAULT '[]'`);
 
       await client.query(`
         CREATE TABLE IF NOT EXISTS guild_snapshots (

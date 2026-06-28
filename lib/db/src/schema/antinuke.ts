@@ -6,6 +6,7 @@ export const antinukeConfigTable = pgTable("antinuke_config", {
   logChannelId:            text("log_channel_id"),
   punishment:              text("punishment").notNull().default("ban"),
   whitelist:               text("whitelist").notNull().default("[]"),
+  roleingExempt:           text("roleing_exempt").notNull().default("[]"),
   toggles:                 text("toggles").notNull().default("{}"),
   banThreshold:            integer("ban_threshold").notNull().default(3),
   kickThreshold:           integer("kick_threshold").notNull().default(5),

@@ -167,6 +167,7 @@ interface AntiNukeConfig {
   logChannelId: string | null;
   punishment: "ban" | "kick" | "strip";
   whitelist: string[];
+  roleingExempt: string[];  // givers in this list skip the giver-strip, receiver still stripped
   toggles: Partial<Record<ToggleKey, boolean>>;
   banThreshold: number;
   kickThreshold: number;
@@ -212,6 +213,8 @@ async function getConfig(guildId: string): Promise<AntiNukeConfig | null> {
   const r = rows[0];
   let whitelist: string[] = [];
   try { whitelist = JSON.parse(r.whitelist ?? "[]"); } catch { whitelist = []; }
+  let roleingExempt: string[] = [];
+  try { roleingExempt = JSON.parse((r as any).roleingExempt ?? "[]"); } catch { roleingExempt = []; }
   let toggles: Partial<Record<ToggleKey, boolean>> = {};
   try { toggles = JSON.parse((r as any).toggles ?? "{}"); } catch { toggles = {}; }
 
@@ -220,6 +223,7 @@ async function getConfig(guildId: string): Promise<AntiNukeConfig | null> {
     logChannelId: r.logChannelId ?? null,
     punishment: (r.punishment as "ban" | "kick" | "strip") ?? "ban",
     whitelist,
+    roleingExempt,
     toggles,
     banThreshold: r.banThreshold,
     kickThreshold: r.kickThreshold,
@@ -1153,12 +1157,13 @@ async function onAuditLogEntry(entry: GuildAuditLogsEntry, guild: Guild): Promis
       }
 
       if (grantedElevatedRoles.length > 0) {
-        // Admin/mod role granted — strip BOTH giver and receiver immediately.
-        // Only BOT_OWNER_ID is exempt.
+        // Elevated role granted — strip receiver immediately, strip giver unless roleing-exempt.
+        // Trusted owner (hardcoded + BOT_OWNER_ID) is always exempt from both.
         const targetId = (entry.target as { id?: string } | null)?.id;
+        const giverRoleingExempt = config.roleingExempt.includes(executorId);
 
         const [giverMember, receiverMember] = await Promise.all([
-          isBotOwner(executorId) ? Promise.resolve(null) : guild.members.fetch(executorId).catch(() => null),
+          (isBotOwner(executorId) || giverRoleingExempt) ? Promise.resolve(null) : guild.members.fetch(executorId).catch(() => null),
           targetId && !isBotOwner(targetId) ? guild.members.fetch(targetId).catch(() => null) : Promise.resolve(null),
         ]);
 
@@ -1170,7 +1175,7 @@ async function onAuditLogEntry(entry: GuildAuditLogsEntry, guild: Guild): Promis
             if (role.managed || role.id === guild.id) continue;
             if (ELEVATED_PERMS_STRIP.some(p => role.permissions.has(p))) {
               try {
-                await giverMember.roles.remove(role, "Anti-Nuke: granted admin/mod role — giver stripped immediately");
+                await giverMember.roles.remove(role, "Anti-Nuke: granted elevated role — giver stripped immediately");
                 giverStripped.push(role.name);
               } catch { /* hierarchy — best effort */ }
             }
@@ -1182,7 +1187,7 @@ async function onAuditLogEntry(entry: GuildAuditLogsEntry, guild: Guild): Promis
             if (role.managed || role.id === guild.id) continue;
             if (ELEVATED_PERMS_STRIP.some(p => role.permissions.has(p))) {
               try {
-                await receiverMember.roles.remove(role, "Anti-Nuke: received admin/mod role — receiver stripped immediately");
+                await receiverMember.roles.remove(role, "Anti-Nuke: received elevated role — receiver stripped immediately");
                 receiverStripped.push(role.name);
               } catch { /* hierarchy — best effort */ }
             }
@@ -1190,28 +1195,42 @@ async function onAuditLogEntry(entry: GuildAuditLogsEntry, guild: Guild): Promis
         }
 
         const executorLabel = entry.executor.tag ?? entry.executor.id;
-        const targetLabel = receiverMember?.user.tag ?? targetId ?? "Unknown";
+        const targetLabel   = receiverMember?.user.tag ?? targetId ?? "Unknown";
+
+        const giverNote = isBotOwner(executorId)
+          ? "Exempt (trusted owner)"
+          : giverRoleingExempt
+            ? "Exempt (roleing-exempt list)"
+            : giverStripped.length > 0
+              ? giverStripped.map(r => `\`${r}\``).join(", ")
+              : "None";
+
+        const receiverNote = targetId && isBotOwner(targetId)
+          ? "Exempt (trusted owner)"
+          : receiverStripped.length > 0
+            ? receiverStripped.map(r => `\`${r}\``).join(", ")
+            : "None";
 
         const embed = new EmbedBuilder()
           .setColor(Colors.DarkRed)
-          .setTitle("🛡️ Admin/Mod Role Granted — Both Users Stripped")
+          .setTitle("🛡️ Elevated Role Granted — Action Taken")
           .setDescription(
-            `<@${executorId}> gave admin/mod role(s) to <@${targetId ?? "unknown"}>. Both users had their admin/mod roles stripped immediately.`
+            `<@${executorId}> gave elevated role(s) to <@${targetId ?? "unknown"}>.`
           )
           .addFields(
-            { name: "Giver",            value: `<@${executorId}> (\`${executorLabel}\`)`,  inline: true },
-            { name: "Receiver",         value: `<@${targetId ?? "?"}> (\`${targetLabel}\`)`, inline: true },
-            { name: "Role(s) Granted",  value: grantedElevatedRoles.map(r => `\`${r.name}\``).join(", "),           inline: false },
-            { name: "Giver Stripped",   value: giverStripped.length > 0 ? giverStripped.map(r => `\`${r}\``).join(", ") : isBotOwner(executorId) ? "Exempt (bot owner)" : "None",    inline: false },
-            { name: "Receiver Stripped", value: receiverStripped.length > 0 ? receiverStripped.map(r => `\`${r}\``).join(", ") : targetId && isBotOwner(targetId) ? "Exempt (bot owner)" : "None", inline: false },
+            { name: "Giver",             value: `<@${executorId}> (\`${executorLabel}\`)`,    inline: true  },
+            { name: "Receiver",          value: `<@${targetId ?? "?"}> (\`${targetLabel}\`)`, inline: true  },
+            { name: "Role(s) Granted",   value: grantedElevatedRoles.map(r => `\`${r.name}\``).join(", "), inline: false },
+            { name: "Giver Stripped",    value: giverNote,    inline: false },
+            { name: "Receiver Stripped", value: receiverNote, inline: false },
           )
-          .setFooter({ text: "Anti-Nuke System  ·  Admin Role Policy" })
+          .setFooter({ text: "Anti-Nuke System  ·  Elevated Role Policy" })
           .setTimestamp();
 
         await logToEnforcementChannel(guild, embed);
 
         recordIncident(guild.id, {
-          violation: "Admin/Mod Role Granted",
+          violation: "Elevated Role Granted",
           executorId,
           executorTag: executorLabel,
           count: 1,
@@ -1220,8 +1239,9 @@ async function onAuditLogEntry(entry: GuildAuditLogsEntry, guild: Guild): Promis
         });
 
         logger.warn(
-          `Anti-nuke: admin role grant by ${executorLabel} (${executorId}) → ${targetId} in guild ${guild.id} — ` +
-          `giver stripped ${giverStripped.length} roles, receiver stripped ${receiverStripped.length} roles`
+          `Anti-nuke: elevated role grant by ${executorLabel} (${executorId}) → ${targetId} in guild ${guild.id} — ` +
+          `giver: ${giverRoleingExempt ? "roleing-exempt, not stripped" : `stripped ${giverStripped.length} roles`}, ` +
+          `receiver: stripped ${receiverStripped.length} roles`
         );
         break;
       }
@@ -1709,6 +1729,62 @@ async function cmdWhitelist(message: Message, args: string[]): Promise<void> {
   )] });
 }
 
+async function cmdRoleingExempt(message: Message, args: string[]): Promise<void> {
+  if (!message.guild) return;
+  if (!db) { await message.reply({ embeds: [errEmbed("Database not configured.")] }); return; }
+
+  const sub    = args[0]?.toLowerCase();
+  const userId = message.mentions.users.first()?.id ?? args[1];
+
+  if (sub === "add") {
+    if (!userId) {
+      await message.reply({ embeds: [errEmbed("**Usage:** `-roleing exempt add @user`")] });
+      return;
+    }
+    const config  = await getConfig(message.guild.id);
+    const current = config?.roleingExempt ?? [];
+    if (current.includes(userId)) {
+      await message.reply({ embeds: [infoEmbed("Already Exempt", `<@${userId}> can already assign roles without being stripped.`)] });
+      return;
+    }
+    await upsertConfig(message.guild.id, { roleingExempt: JSON.stringify([...current, userId]) });
+    await message.reply({ embeds: [okEmbed("Roleing Exempt Updated", `<@${userId}> can now assign roles without being stripped.\nThe person they role is **still** stripped.`)] });
+    return;
+  }
+
+  if (sub === "remove") {
+    if (!userId) {
+      await message.reply({ embeds: [errEmbed("**Usage:** `-roleing exempt remove @user`")] });
+      return;
+    }
+    const config  = await getConfig(message.guild.id);
+    const current = config?.roleingExempt ?? [];
+    await upsertConfig(message.guild.id, { roleingExempt: JSON.stringify(current.filter(id => id !== userId)) });
+    await message.reply({ embeds: [okEmbed("Roleing Exempt Updated", `<@${userId}> has been removed — they will now be stripped when assigning elevated roles.`)] });
+    return;
+  }
+
+  if (sub === "list") {
+    const config = await getConfig(message.guild.id);
+    const list   = config?.roleingExempt ?? [];
+    await message.reply({ embeds: [infoEmbed(
+      "Roleing Exempt Users",
+      list.length > 0
+        ? list.map(id => `<@${id}>  \`${id}\``).join("\n") +
+          "\n\n*These users can assign roles without being stripped. The receiver is still stripped.*"
+        : "No users are currently roleing-exempt."
+    )] });
+    return;
+  }
+
+  await message.reply({ embeds: [errEmbed(
+    "**Usage:**\n" +
+    "`-roleing exempt add @user` — allow user to assign roles without being stripped\n" +
+    "`-roleing exempt remove @user` — revoke exemption\n" +
+    "`-roleing exempt list` — show all exempt users"
+  )] });
+}
+
 async function cmdReset(message: Message): Promise<void> {
   if (!message.guild) return;
   if (!db) { await message.reply({ embeds: [errEmbed("Database not configured.")] }); return; }
@@ -2158,6 +2234,8 @@ export async function handleAntiNukeCommand(message: Message, args: string[]): P
     case "status":    return cmdStatus(message);
     case "set":       return cmdSet(message, args.slice(1));
     case "whitelist": return cmdWhitelist(message, args.slice(1));
+    case "roleing-exempt":
+    case "roleingexempt": return cmdRoleingExempt(message, args.slice(1));
     case "reset":     return cmdReset(message);
     case "snapshot":  return cmdSnapshot(message);
     case "restore":   return cmdRestore(message);

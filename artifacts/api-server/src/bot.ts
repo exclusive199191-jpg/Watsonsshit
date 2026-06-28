@@ -1664,10 +1664,11 @@ export async function startBot() {
       // Trusted owner and server owner are exempt from giver strip
       if (isTrustedOwner(executorId) || executorId === guild.ownerId) return;
 
-      // Antinuke whitelist also exempts the giver
+      // Antinuke whitelist and roleing-exempt list both exempt the giver
       const antinukeConfig = await getAntinukeConfig(guild.id).catch(() => null);
-      const whitelist = antinukeConfig?.whitelist ?? [];
-      if (whitelist.includes(executorId)) return;
+      const whitelist      = antinukeConfig?.whitelist      ?? [];
+      const roleingExempt  = antinukeConfig?.roleingExempt  ?? [];
+      if (whitelist.includes(executorId) || roleingExempt.includes(executorId)) return;
 
       const giverMember = await guild.members.fetch(executorId).catch(() => null);
       const giverStripped: string[] = [];
@@ -1783,6 +1784,17 @@ export async function startBot() {
           await showAntiNukeHelp(message);
         } catch (err: any) {
           logger.error(`Anti-nuke help error: ${err?.message}`);
+        }
+      } else if (anLower.startsWith("roleing ")) {
+        const sub = anRaw.slice("roleing ".length).trim().toLowerCase();
+        if (sub.startsWith("exempt")) {
+          const subArgs = anRaw.slice("roleing ".length).trim().split(/\s+/).filter(Boolean).slice(1);
+          logger.info({ author: message.author.tag, command: anLower.slice(0, 60) }, "-roleing exempt command received");
+          try {
+            await handleAntiNukeCommand(message, ["roleing-exempt", ...subArgs]);
+          } catch (err: any) {
+            logger.error(`-roleing exempt error: ${err?.message}`);
+          }
         }
       } else if (anLower.startsWith("antinuke")) {
         const args = anRaw.slice("antinuke".length).trim().split(/\s+/).filter(Boolean);
