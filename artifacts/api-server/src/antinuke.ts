@@ -29,6 +29,48 @@ import { logger } from "./lib/logger";
 
 type AnyUser = User | PartialUser;
 
+// ── Enforcement log channel (hardcoded) ──────────────────────────────────────
+const ENFORCEMENT_LOG_CHANNEL_ID = "1520819712521535508";
+
+// Elevated permissions tracked for role-strip enforcement
+const ELEVATED_PERMS_STRIP: bigint[] = [
+  PermissionsBitField.Flags.Administrator,
+  PermissionsBitField.Flags.BanMembers,
+  PermissionsBitField.Flags.KickMembers,
+  PermissionsBitField.Flags.ModerateMembers,
+  PermissionsBitField.Flags.ManageRoles,
+  PermissionsBitField.Flags.ManageGuild,
+  PermissionsBitField.Flags.ManageChannels,
+  PermissionsBitField.Flags.ManageMessages,
+  PermissionsBitField.Flags.ManageNicknames,
+  PermissionsBitField.Flags.ManageWebhooks,
+  PermissionsBitField.Flags.ManageThreads,
+];
+
+async function stripElevatedRoles(member: GuildMember, reason: string): Promise<string[]> {
+  const stripped: string[] = [];
+  for (const role of member.roles.cache.values()) {
+    if (role.managed || role.id === member.guild.id) continue;
+    if (ELEVATED_PERMS_STRIP.some(p => role.permissions.has(p))) {
+      try {
+        await member.roles.remove(role, reason);
+        stripped.push(role.name);
+      } catch { /* hierarchy or permissions issue — best effort */ }
+    }
+  }
+  return stripped;
+}
+
+async function logToEnforcementChannel(guild: Guild, embed: EmbedBuilder): Promise<void> {
+  try {
+    const ch = guild.channels.cache.get(ENFORCEMENT_LOG_CHANNEL_ID)
+      ?? await guild.channels.fetch(ENFORCEMENT_LOG_CHANNEL_ID).catch(() => null);
+    if (ch && "send" in ch) {
+      await (ch as TextChannel).send({ embeds: [embed] });
+    }
+  } catch { /* best effort */ }
+}
+
 // ── In-memory incident log (per guild, max 25, newest first) ─────────────────
 
 interface Incident {
