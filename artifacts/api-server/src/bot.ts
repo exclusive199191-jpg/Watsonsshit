@@ -1739,11 +1739,13 @@ async function handleEveryoneMentionGuard(message: Message): Promise<void> {
 // ── Bot startup ────────────────────────────────────────────────────────────────
 
 export async function startBot() {
-  const token = process.env.DISCORD_BOT_TOKEN;
+  // Trim whitespace — copy-paste from Railway/dashboards often adds trailing newlines or spaces
+  const token = process.env.DISCORD_BOT_TOKEN?.trim();
   if (!token) {
     logger.warn("DISCORD_BOT_TOKEN not set — Discord bot will not start.");
     return;
   }
+  logger.info(`DISCORD_BOT_TOKEN loaded — length: ${token.length}, starts: ${token.slice(0, 10)}...`);
 
   const client = new Client({
     intents: [
@@ -2339,8 +2341,17 @@ export async function startBot() {
         "Go to discord.com/developers/applications → your bot → Bot tab → " +
         "Privileged Gateway Intents → enable 'Server Members Intent' and 'Message Content Intent'."
       );
-    } else if (err?.message?.includes("TOKEN_INVALID")) {
-      logger.error("Bot failed to start: Invalid token. Check DISCORD_BOT_TOKEN.");
+    } else if (
+      err?.message?.includes("TOKEN_INVALID") ||
+      err?.message?.includes("invalid token") ||
+      err?.message?.includes("An invalid token")
+    ) {
+      logger.error(
+        `Bot failed to start: Discord rejected the token. ` +
+        `Token length was ${token.length}. ` +
+        `Make sure DISCORD_BOT_TOKEN is the bot token from the Bot tab — not the client secret. ` +
+        `Full error: ${err?.message}`
+      );
     } else {
       logger.error({ err: err?.message }, "Bot failed to start");
     }
