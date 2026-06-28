@@ -47,9 +47,11 @@ const ELEVATED_PERMS_STRIP: bigint[] = [
   PermissionsBitField.Flags.Administrator,
   PermissionsBitField.Flags.BanMembers,
   PermissionsBitField.Flags.KickMembers,
-  PermissionsBitField.Flags.ModerateMembers,
+  PermissionsBitField.Flags.ModerateMembers,  // Timeout
+  PermissionsBitField.Flags.MuteMembers,       // Voice mute
   PermissionsBitField.Flags.ManageRoles,
   PermissionsBitField.Flags.ManageGuild,
+  PermissionsBitField.Flags.ViewAuditLog,
   PermissionsBitField.Flags.ManageChannels,
   PermissionsBitField.Flags.ManageMessages,
   PermissionsBitField.Flags.ManageNicknames,

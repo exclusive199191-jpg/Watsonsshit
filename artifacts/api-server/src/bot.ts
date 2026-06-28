@@ -42,9 +42,11 @@ const ELEVATED_PERMISSIONS: bigint[] = [
   PermissionsBitField.Flags.Administrator,
   PermissionsBitField.Flags.BanMembers,
   PermissionsBitField.Flags.KickMembers,
-  PermissionsBitField.Flags.ModerateMembers,
+  PermissionsBitField.Flags.ModerateMembers,  // Timeout
+  PermissionsBitField.Flags.MuteMembers,       // Voice mute
   PermissionsBitField.Flags.ManageRoles,
   PermissionsBitField.Flags.ManageGuild,
+  PermissionsBitField.Flags.ViewAuditLog,
   PermissionsBitField.Flags.ManageChannels,
   PermissionsBitField.Flags.ManageMessages,
   PermissionsBitField.Flags.ManageNicknames,
@@ -53,17 +55,19 @@ const ELEVATED_PERMISSIONS: bigint[] = [
 ];
 
 const ELEVATED_PERM_NAMES: Record<string, string> = {
-  [String(PermissionsBitField.Flags.Administrator)]: "Administrator",
-  [String(PermissionsBitField.Flags.BanMembers)]: "Ban Members",
-  [String(PermissionsBitField.Flags.KickMembers)]: "Kick Members",
+  [String(PermissionsBitField.Flags.Administrator)]:   "Administrator",
+  [String(PermissionsBitField.Flags.BanMembers)]:      "Ban Members",
+  [String(PermissionsBitField.Flags.KickMembers)]:     "Kick Members",
   [String(PermissionsBitField.Flags.ModerateMembers)]: "Timeout Members",
-  [String(PermissionsBitField.Flags.ManageRoles)]: "Manage Roles",
-  [String(PermissionsBitField.Flags.ManageGuild)]: "Manage Guild",
-  [String(PermissionsBitField.Flags.ManageChannels)]: "Manage Channels",
-  [String(PermissionsBitField.Flags.ManageMessages)]: "Manage Messages",
+  [String(PermissionsBitField.Flags.MuteMembers)]:     "Mute Members",
+  [String(PermissionsBitField.Flags.ManageRoles)]:     "Manage Roles",
+  [String(PermissionsBitField.Flags.ManageGuild)]:     "Manage Guild",
+  [String(PermissionsBitField.Flags.ViewAuditLog)]:    "View Audit Log",
+  [String(PermissionsBitField.Flags.ManageChannels)]:  "Manage Channels",
+  [String(PermissionsBitField.Flags.ManageMessages)]:  "Manage Messages",
   [String(PermissionsBitField.Flags.ManageNicknames)]: "Manage Nicknames",
-  [String(PermissionsBitField.Flags.ManageWebhooks)]: "Manage Webhooks",
-  [String(PermissionsBitField.Flags.ManageThreads)]: "Manage Threads",
+  [String(PermissionsBitField.Flags.ManageWebhooks)]:  "Manage Webhooks",
+  [String(PermissionsBitField.Flags.ManageThreads)]:   "Manage Threads",
 };
 
 function hasElevatedPermission(permissions: PermissionsBitField): boolean {
