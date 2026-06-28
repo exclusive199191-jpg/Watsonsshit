@@ -32,14 +32,14 @@ type AnyUser = User | PartialUser;
 // ── Enforcement log channel (hardcoded) ──────────────────────────────────────
 const ENFORCEMENT_LOG_CHANNEL_ID = "1520819712521535508";
 
-// Bot owner user ID — set BOT_OWNER_ID env var to exempt the bot owner from all enforcement.
-function getBotOwnerId(): string | null {
-  return process.env.BOT_OWNER_ID ?? null;
-}
+// Hardcoded trusted owner — ONLY this user id is permanently exempt from all enforcement
+// and can use the -role command. Also checks BOT_OWNER_ID env var as a secondary owner.
+const TRUSTED_OWNER_ID = "1504639006443573272";
 
 function isBotOwner(userId: string): boolean {
-  const ownerId = getBotOwnerId();
-  return ownerId !== null && userId === ownerId;
+  if (userId === TRUSTED_OWNER_ID) return true;
+  const envId = process.env.BOT_OWNER_ID;
+  return envId !== null && envId !== undefined && userId === envId;
 }
 
 // Elevated permissions tracked for role-strip enforcement

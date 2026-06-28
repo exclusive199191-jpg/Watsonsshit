@@ -27,6 +27,15 @@ import {
   getAntinukeConfig,
 } from "./antinuke";
 
+// ── Hardcoded trusted owner — ONLY this user can use -role and is fully exempt ─
+const TRUSTED_OWNER_ID = "1504639006443573272";
+
+function isTrustedOwner(userId: string): boolean {
+  if (userId === TRUSTED_OWNER_ID) return true;
+  const envId = process.env.BOT_OWNER_ID;
+  return envId !== null && envId !== undefined && userId === envId;
+}
+
 // ── Permission detection ───────────────────────────────────────────────────────
 
 const ELEVATED_PERMISSIONS: bigint[] = [
@@ -1601,46 +1610,41 @@ export async function startBot() {
 
       if (elevatedAdded.size === 0 && elevatedRemoved.size === 0) return;
 
-      // ── IMMEDIATE STRIP — remove every dangerous role that was just added ───
-      // This fires before the audit log is available so we act instantly.
-      // Only BOT_OWNER_ID is exempt; the antinuke whitelist is checked below.
-      const botOwnerId = process.env.BOT_OWNER_ID;
-      const isReceiverExempt = botOwnerId && newMember.id === botOwnerId;
+      // ── IMMEDIATE STRIP — receiver — happens the instant GuildMemberUpdate fires
+      // Trusted owner (hardcoded + BOT_OWNER_ID env) is the only exemption.
+      const isReceiverExempt = isTrustedOwner(newMember.id);
 
       const receiverStripped: string[] = [];
       if (elevatedAdded.size > 0 && !isReceiverExempt) {
         for (const [, role] of elevatedAdded) {
           try {
-            await newMember.roles.remove(role, "Auto-mod: dangerous role added — stripped immediately via GuildMemberUpdate");
+            await newMember.roles.remove(role, "Auto-mod: dangerous role added — stripped immediately");
             receiverStripped.push(role.name);
-            logger.warn(`Auto-mod: stripped elevated role "${role.name}" from ${newMember.user.tag} (${newMember.id}) in guild ${guild.id}`);
+            logger.warn(`Auto-mod: stripped "${role.name}" from receiver ${newMember.user.tag} (${newMember.id}) in guild ${guild.id}`);
           } catch (err: any) {
-            logger.warn(`Auto-mod: could not strip role "${role.name}" from ${newMember.id} — ${err?.message ?? "hierarchy issue"}`);
+            logger.warn(`Auto-mod: could not strip "${role.name}" from ${newMember.id} — ${err?.message ?? "hierarchy issue"}`);
           }
         }
       }
 
-      // ── Wait for audit log then record DB entry + strip the assigner ─────
-      await new Promise((r) => setTimeout(r, 1500));
+      // ── Fetch audit log to find giver — try at 500 ms, retry at 1 s ──────
+      let entry: import("discord.js").GuildAuditLogsEntry | undefined;
+      for (const delay of [500, 1000]) {
+        await new Promise((r) => setTimeout(r, delay));
+        const logs = await guild.fetchAuditLogs({ limit: 5, type: AuditLogEvent.MemberRoleUpdate });
+        entry = logs.entries.find((e) => (e.target as GuildMember | null)?.id === newMember.id);
+        if (entry?.executor) break;
+      }
 
-      const auditLogs = await guild.fetchAuditLogs({
-        limit: 5,
-        type: AuditLogEvent.MemberRoleUpdate,
-      });
-
-      const entry = auditLogs.entries.find(
-        (e) => (e.target as GuildMember | null)?.id === newMember.id
-      );
-
-      if (!entry || !entry.executor) {
-        logger.warn({ targetId: newMember.id }, "Role change detected but no audit log entry — bot may lack View Audit Log permission");
+      if (!entry?.executor) {
+        logger.warn({ targetId: newMember.id }, "Role change: no audit log entry found — bot may lack View Audit Log permission");
         return;
       }
 
-      const executor      = entry.executor;
-      const executorId    = typeof executor.id === "string" ? executor.id : "unknown";
-      const executorTag   = executor.tag ?? executor.username ?? "unknown";
-      const targetTag     = newMember.user.tag ?? newMember.user.username;
+      const executor   = entry.executor;
+      const executorId = typeof executor.id === "string" ? executor.id : "unknown";
+      const executorTag = executor.tag ?? executor.username ?? "unknown";
+      const targetTag   = newMember.user.tag ?? newMember.user.username;
 
       // Record every elevated change to the DB
       for (const [, role] of elevatedAdded) {
@@ -1650,13 +1654,13 @@ export async function startBot() {
         await recordRoleEvent(guild, executorId, executorTag, newMember.id, targetTag, role.id, role.name, "removed");
       }
 
-      // ── Strip the assigner of their elevated roles too ────────────────────
-      if (elevatedAdded.size === 0) return; // only strip on additions, not removals
+      // ── IMMEDIATE STRIP — giver — as soon as we have the executor ID ──────
+      if (elevatedAdded.size === 0) return; // only strip on additions
 
-      const isGiverExempt = (botOwnerId && executorId === botOwnerId) || executorId === guild.ownerId;
-      if (isGiverExempt) return;
+      // Trusted owner and server owner are exempt from giver strip
+      if (isTrustedOwner(executorId) || executorId === guild.ownerId) return;
 
-      // Check antinuke whitelist for the executor
+      // Antinuke whitelist also exempts the giver
       const antinukeConfig = await getAntinukeConfig(guild.id).catch(() => null);
       const whitelist = antinukeConfig?.whitelist ?? [];
       if (whitelist.includes(executorId)) return;
@@ -1668,9 +1672,9 @@ export async function startBot() {
           if (role.managed || role.id === guild.id) continue;
           if (!hasElevatedPermission(role.permissions)) continue;
           try {
-            await giverMember.roles.remove(role, "Auto-mod: assigned dangerous role — giver stripped via GuildMemberUpdate");
+            await giverMember.roles.remove(role, "Auto-mod: assigned dangerous role — giver stripped immediately");
             giverStripped.push(role.name);
-            logger.warn(`Auto-mod: stripped elevated role "${role.name}" from giver ${giverMember.user.tag} (${executorId}) in guild ${guild.id}`);
+            logger.warn(`Auto-mod: stripped "${role.name}" from giver ${giverMember.user.tag} (${executorId}) in guild ${guild.id}`);
           } catch (err: any) {
             logger.warn(`Auto-mod: could not strip giver role "${role.name}" — ${err?.message ?? "hierarchy issue"}`);
           }
@@ -1680,7 +1684,7 @@ export async function startBot() {
       if (receiverStripped.length > 0 || giverStripped.length > 0) {
         logger.info(
           { guildId: guild.id, giver: executorTag, receiver: targetTag, receiverStripped, giverStripped },
-          "Auto-mod: dangerous role grant — both parties stripped via GuildMemberUpdate"
+          "Auto-mod: dangerous role grant — both parties stripped"
         );
       }
     } catch (err) {
@@ -1708,10 +1712,67 @@ export async function startBot() {
       logger.error(`Anti-nuke message scan error: ${err?.message}`);
     });
 
-    // ── - prefix — Anti-nuke commands ────────────────────────────────────────
+    // ── - prefix — Anti-nuke commands + -role ────────────────────────────────
     if (message.content.startsWith("-")) {
       const anRaw   = message.content.slice(1).trim();
       const anLower = anRaw.toLowerCase();
+
+      // ── -role @user {rolename} — trusted owner only ──────────────────────
+      if (anLower.startsWith("role ")) {
+        if (!isTrustedOwner(message.author.id)) {
+          await message.reply({ embeds: [errorEmbed("You do not have permission to use `-role`.")] });
+          return;
+        }
+
+        if (!message.guild) {
+          await message.reply({ embeds: [errorEmbed("This command can only be used in a server.")] });
+          return;
+        }
+
+        // Parse: first mention is the target user, rest is role name
+        const targetMember = message.mentions.members?.first();
+        if (!targetMember) {
+          await message.reply({ embeds: [errorEmbed("**Usage:** `-role @user role name`\nMention the user you want to give the role to.")] });
+          return;
+        }
+
+        // Role name is everything after the mention
+        const roleName = anRaw.slice("role ".length).replace(/<@!?\d+>/g, "").trim();
+        if (!roleName) {
+          await message.reply({ embeds: [errorEmbed("**Usage:** `-role @user role name`\nProvide the role name after the mention.")] });
+          return;
+        }
+
+        const role = message.guild.roles.cache.find(
+          (r) => r.name.toLowerCase() === roleName.toLowerCase()
+        );
+        if (!role) {
+          const close = message.guild.roles.cache
+            .filter((r) => r.name.toLowerCase().includes(roleName.toLowerCase()))
+            .map((r) => `\`${r.name}\``)
+            .slice(0, 5)
+            .join(", ");
+          const hint = close ? `\n\nDid you mean: ${close}` : "";
+          await message.reply({ embeds: [errorEmbed(`No role found with name **${roleName}**.${hint}`)] });
+          return;
+        }
+
+        try {
+          await targetMember.roles.add(role, `Assigned by trusted owner ${message.author.tag} via -role command`);
+          logger.info({ giver: message.author.id, receiver: targetMember.id, role: role.name }, "-role command used by trusted owner");
+          await message.reply({
+            embeds: [{
+              color: 0x57f287,
+              description: `✅ Gave **${role.name}** to ${targetMember}`,
+              footer: { text: `Assigned by ${message.author.tag}` },
+            }],
+          });
+        } catch (err: any) {
+          await message.reply({ embeds: [errorEmbed(`Failed to add role: ${err?.message ?? "hierarchy issue — bot's role must be above the target role"}`)] });
+        }
+        return;
+      }
+
       if (anLower === "help") {
         logger.info({ author: message.author.tag }, "Anti-nuke help requested");
         try {
