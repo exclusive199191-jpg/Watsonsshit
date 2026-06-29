@@ -1865,48 +1865,26 @@ export async function startBot() {
     stopSnapshotSchedule(guild.id);
   });
 
-  // ── Track role assignments + immediately strip dangerous roles ───────────────
+  // ── Track role assignments + strip dangerous roles from giver and receiver ────
   client.on(Events.GuildMemberUpdate, async (oldMember, newMember) => {
     try {
       const guild = newMember.guild;
 
-      const addedRoles = newMember.roles.cache.filter((r) => !oldMember.roles.cache.has(r.id));
+      const addedRoles   = newMember.roles.cache.filter((r) => !oldMember.roles.cache.has(r.id));
       const removedRoles = oldMember.roles.cache.filter((r) => !newMember.roles.cache.has(r.id));
 
       const elevatedAdded   = addedRoles.filter((r) => hasElevatedPermission(r.permissions));
       const elevatedRemoved = removedRoles.filter((r) => hasElevatedPermission(r.permissions));
 
-      // We need to continue even for non-elevated role additions ONLY when the
-      // mention-guard has flagged users in this guild — otherwise skip to avoid
-      // burning audit-log rate-limit budget on every ordinary role change.
-      const anyRoleAdded       = addedRoles.size > 0;
-      const anyFlaggedInGuild  = (flaggedMentionUsers.get(guild.id)?.size ?? 0) > 0;
+      // Skip if nothing relevant happened — only proceed for elevated changes or
+      // any role change when mention-guard has flagged users in this guild.
+      const anyRoleAdded      = addedRoles.size > 0;
+      const anyFlaggedInGuild = (flaggedMentionUsers.get(guild.id)?.size ?? 0) > 0;
       if (elevatedAdded.size === 0 && elevatedRemoved.size === 0 && !(anyRoleAdded && anyFlaggedInGuild)) return;
 
-      // ── IMMEDIATE STRIP — receiver — happens the instant GuildMemberUpdate fires
-      // Trusted owner (hardcoded + BOT_OWNER_ID env) is the only exemption.
-      const isReceiverExempt = isTrustedOwner(newMember.id);
-
-      const receiverStripped: string[] = [];
-      if (elevatedAdded.size > 0 && !isReceiverExempt) {
-        const botHighest = guild.members.me?.roles.highest;
-        for (const [, role] of elevatedAdded) {
-          // Only attempt removal of roles strictly below the bot's highest role
-          if (botHighest && role.comparePositionTo(botHighest) >= 0) {
-            logger.warn(`Auto-mod: skipping "${role.name}" from receiver ${newMember.user.tag} — at or above bot's highest role "${botHighest.name}"`);
-            continue;
-          }
-          try {
-            await newMember.roles.remove(role, "Auto-mod: dangerous role added — stripped immediately");
-            receiverStripped.push(role.name);
-            logger.warn(`Auto-mod: stripped "${role.name}" from receiver ${newMember.user.tag} (${newMember.id}) in guild ${guild.id}`);
-          } catch (err: any) {
-            logger.warn(`Auto-mod: could not strip "${role.name}" from ${newMember.id} — ${err?.message ?? "hierarchy issue"}`);
-          }
-        }
-      }
-
-      // ── Fetch audit log to find giver — try at 500 ms, retry at 1 s ──────
+      // ── Fetch audit log first — we need the executor before deciding any strip ──
+      // We must know WHO assigned the role before stripping, because whitelist /
+      // roleingExempt givers bypass ALL enforcement (receiver and giver both safe).
       let entry: import("discord.js").GuildAuditLogsEntry | undefined;
       for (const delay of [500, 1000]) {
         await new Promise((r) => setTimeout(r, delay));
@@ -1920,12 +1898,24 @@ export async function startBot() {
         return;
       }
 
-      const executor   = entry.executor;
-      const executorId = typeof executor.id === "string" ? executor.id : "unknown";
+      const executor    = entry.executor;
+      const executorId  = typeof executor.id === "string" ? executor.id : "unknown";
       const executorTag = executor.tag ?? executor.username ?? "unknown";
       const targetTag   = newMember.user.tag ?? newMember.user.username;
 
-      // Record every elevated change to the DB
+      // ── Exemption check ──────────────────────────────────────────────────────
+      // Whitelist and roleingExempt givers bypass ALL strips — neither the giver
+      // nor the receiver gets touched. Trusted owner and server owner are always exempt.
+      const antinukeConfig = await getAntinukeConfig(guild.id).catch(() => null);
+      const whitelist      = antinukeConfig?.whitelist     ?? [];
+      const roleingExempt  = antinukeConfig?.roleingExempt ?? [];
+      const isGiverExempt  =
+        isTrustedOwner(executorId) ||
+        executorId === guild.ownerId ||
+        whitelist.includes(executorId) ||
+        roleingExempt.includes(executorId);
+
+      // Record every elevated change to the DB (always — even for exempt givers)
       for (const [, role] of elevatedAdded) {
         await recordRoleEvent(guild, executorId, executorTag, newMember.id, targetTag, role.id, role.name, "assigned");
       }
@@ -1933,17 +1923,68 @@ export async function startBot() {
         await recordRoleEvent(guild, executorId, executorTag, newMember.id, targetTag, role.id, role.name, "removed");
       }
 
-      // Fetch antinuke config — used to check roleingExempt for mention-guard enforcement
-      const antinukeConfig = await getAntinukeConfig(guild.id).catch(() => null);
-      const roleingExempt  = antinukeConfig?.roleingExempt  ?? [];
+      if (isGiverExempt) {
+        logger.info(`Auto-mod: giver ${executorTag} (${executorId}) is exempt — no strips applied`);
+        return;
+      }
 
-      // ── Mention-guard: flag check on ANY role assignment ─────────────────────
-      // If the executor was previously flagged for @everyone/@here abuse, strip
-      // their admin/mod/staff roles the moment they try to assign any role to anyone.
-      // roleingExempt users are excluded — they can assign roles freely.
-      // This runs regardless of whether the assigned role is elevated.
-      if (anyRoleAdded && isMentionFlagged(guild.id, executorId) && !isTrustedOwner(executorId) && executorId !== guild.ownerId && !roleingExempt.includes(executorId)) {
-        const flaggedGiver = await guild.members.fetch(executorId).catch(() => null);
+      const botHighest = guild.members.me?.roles.highest;
+
+      // ── STRIP RECEIVER — remove the elevated roles that were just added ───────
+      const isReceiverExempt = isTrustedOwner(newMember.id);
+      const receiverStripped: string[] = [];
+
+      if (elevatedAdded.size > 0 && !isReceiverExempt) {
+        for (const [, role] of elevatedAdded) {
+          if (botHighest && role.comparePositionTo(botHighest) >= 0) {
+            logger.warn(`Auto-mod: skipping "${role.name}" from receiver ${newMember.user.tag} — above bot's highest role`);
+            continue;
+          }
+          try {
+            await newMember.roles.remove(role, "Auto-mod: dangerous role assigned — stripped from receiver");
+            receiverStripped.push(role.name);
+            logger.warn(`Auto-mod: stripped "${role.name}" from receiver ${newMember.user.tag} (${newMember.id})`);
+          } catch (err: any) {
+            logger.warn(`Auto-mod: could not strip "${role.name}" from receiver ${newMember.id} — ${err?.message ?? "hierarchy issue"}`);
+          }
+        }
+      }
+
+      // ── STRIP GIVER — remove their own elevated roles as punishment ───────────
+      const giverMember = await guild.members.fetch(executorId).catch(() => null);
+      const giverStripped: string[] = [];
+
+      if (giverMember && elevatedAdded.size > 0) {
+        for (const [, role] of giverMember.roles.cache) {
+          if (role.managed || role.id === guild.id) continue;
+          if (!hasElevatedPermission(role.permissions)) continue;
+          if (botHighest && role.comparePositionTo(botHighest) >= 0) {
+            logger.warn(`Auto-mod: skipping "${role.name}" from giver ${executorTag} — above bot's highest role`);
+            continue;
+          }
+          try {
+            await giverMember.roles.remove(role, "Auto-mod: assigned dangerous role — giver stripped");
+            giverStripped.push(role.name);
+            logger.warn(`Auto-mod: stripped "${role.name}" from giver ${executorTag} (${executorId})`);
+          } catch (err: any) {
+            logger.warn(`Auto-mod: could not strip giver role "${role.name}" — ${err?.message ?? "hierarchy issue"}`);
+          }
+        }
+      }
+
+      if (receiverStripped.length > 0 || giverStripped.length > 0) {
+        logger.info(
+          { guildId: guild.id, giver: executorTag, receiver: targetTag, receiverStripped, giverStripped },
+          "Auto-mod: elevated role grant — both giver and receiver stripped"
+        );
+      }
+
+      // ── Mention-guard: extra punishment for @everyone/@here flagged users ─────
+      // If the executor was previously flagged for @everyone/@here abuse, they also
+      // get their admin/mod/staff roles stripped on ANY role assignment (even non-elevated).
+      // roleingExempt already handled above — this block only runs for non-exempt users.
+      if (anyRoleAdded && isMentionFlagged(guild.id, executorId)) {
+        const flaggedGiver = giverMember ?? await guild.members.fetch(executorId).catch(() => null);
         if (flaggedGiver) {
           logger.warn(
             `[MENTION-GUARD] Flagged user ${executorTag} (${executorId}) attempted role assignment ` +
@@ -1953,11 +1994,8 @@ export async function startBot() {
             flaggedGiver,
             "Mention-guard: flagged user (@everyone/@here abuse) attempted role assignment",
           );
-          logger.info(
-            `[MENTION-GUARD] Stripped ${mgStripped.length} elevated role(s) from flagged user ` +
-            `${executorTag}: ${mgStripped.join(", ") || "none"}`,
-          );
-          // Post an enforcement embed where the role assignment happened
+          logger.info(`[MENTION-GUARD] Stripped ${mgStripped.length} elevated role(s) from flagged user ${executorTag}: ${mgStripped.join(", ") || "none"}`);
+
           const anyTextCh = [...guild.channels.cache.values()].find((c) => "send" in c) as any;
           if (anyTextCh) {
             await anyTextCh.send({
@@ -1979,17 +2017,6 @@ export async function startBot() {
             }).catch(() => null);
           }
         }
-      }
-
-      // Givers are NOT automatically stripped — anyone can assign roles freely.
-      // Only the receiver has elevated roles removed (above).
-      // The giver is only punished if they are flagged for @everyone/@here abuse
-      // (handled in the mention-guard section above).
-      if (receiverStripped.length > 0) {
-        logger.info(
-          { guildId: guild.id, giver: executorTag, receiver: targetTag, receiverStripped },
-          "Auto-mod: elevated role granted — receiver stripped, giver left untouched"
-        );
       }
     } catch (err) {
       logger.error({ err }, "Error handling GuildMemberUpdate");
