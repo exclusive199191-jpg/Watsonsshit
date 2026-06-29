@@ -1674,29 +1674,36 @@ async function stripElevatedRolesFromMember(member: GuildMember, reason: string)
  *   4. Posts a visible alert embed in the channel.
  */
 async function handleEveryoneMentionGuard(message: Message): Promise<void> {
-  // Guard: only process messages in guilds with a known member
-  if (!message.guild || !message.member) return;
+  // Guard: only process messages in guilds
+  if (!message.guild) return;
   // Guard: never act on bots (MessageCreate already checks, but be explicit)
   if (message.author.bot) return;
   // Guard: never act on the bot itself
   if (message.author.id === message.client.user?.id) return;
 
-  // Detect @everyone / @here — either an actual Discord ping or literal text
-  const discordPing  = message.mentions.everyone; // true for both @everyone and @here pings
-  const literalMatch = /@everyone|@here/i.test(message.content);
+  const guild = message.guild;
+
+  // Detect @everyone / @here
+  //   message.mentions.everyone  — set by Discord for actual pings (works with or without content intent)
+  //   regex fallback             — catches literal "@everyone"/"@here" text when content intent IS enabled
+  const discordPing  = message.mentions.everyone;
+  const literalMatch = message.content ? /@everyone|@here/i.test(message.content) : false;
 
   if (!discordPing && !literalMatch) return; // nothing to do
 
   // Trusted owner is permanently exempt from all enforcement
   if (isTrustedOwner(message.author.id)) {
-    logger.info(
-      `[MENTION-GUARD] @everyone/@here from trusted owner ${message.author.tag} — skipped`,
-    );
+    logger.info(`[MENTION-GUARD] @everyone/@here from trusted owner ${message.author.tag} — skipped`);
     return;
   }
 
-  const member    = message.member;
-  const guild     = message.guild;
+  // Resolve the GuildMember — use cache first, fall back to a live fetch.
+  // message.member can be null when the member isn't cached (common after bot restart).
+  let member = message.member ?? await guild.members.fetch(message.author.id).catch(() => null);
+  if (!member) {
+    logger.warn(`[MENTION-GUARD] Could not resolve member for ${message.author.tag} (${message.author.id}) — skipping strip`);
+    return;
+  }
   const pingType  = discordPing ? "Discord ping" : "literal text";
 
   logger.warn(
@@ -1926,9 +1933,8 @@ export async function startBot() {
         await recordRoleEvent(guild, executorId, executorTag, newMember.id, targetTag, role.id, role.name, "removed");
       }
 
-      // ── Fetch antinuke config once — used by both mention-guard and giver-strip ──
+      // Fetch antinuke config — used to check roleingExempt for mention-guard enforcement
       const antinukeConfig = await getAntinukeConfig(guild.id).catch(() => null);
-      const whitelist      = antinukeConfig?.whitelist      ?? [];
       const roleingExempt  = antinukeConfig?.roleingExempt  ?? [];
 
       // ── Mention-guard: flag check on ANY role assignment ─────────────────────
@@ -1975,42 +1981,14 @@ export async function startBot() {
         }
       }
 
-      // ── IMMEDIATE STRIP — giver — as soon as we have the executor ID ──────
-      if (elevatedAdded.size === 0) return; // standard giver-strip only on elevated additions
-
-      // Trusted owner and server owner are exempt from giver strip
-      if (isTrustedOwner(executorId) || executorId === guild.ownerId) return;
-
-      // Antinuke whitelist and roleing-exempt list both exempt the giver
-      // (antinukeConfig / whitelist / roleingExempt already fetched above)
-      if (whitelist.includes(executorId) || roleingExempt.includes(executorId)) return;
-
-      const giverMember = await guild.members.fetch(executorId).catch(() => null);
-      const giverStripped: string[] = [];
-      if (giverMember) {
-        const botHighest = guild.members.me?.roles.highest;
-        for (const [, role] of giverMember.roles.cache) {
-          if (role.managed || role.id === guild.id) continue;
-          if (!hasElevatedPermission(role.permissions)) continue;
-          // Only remove roles strictly below the bot's highest role
-          if (botHighest && role.comparePositionTo(botHighest) >= 0) {
-            logger.warn(`Auto-mod: skipping "${role.name}" from giver ${giverMember.user.tag} — at or above bot's highest role "${botHighest.name}"`);
-            continue;
-          }
-          try {
-            await giverMember.roles.remove(role, "Auto-mod: assigned dangerous role — giver stripped immediately");
-            giverStripped.push(role.name);
-            logger.warn(`Auto-mod: stripped "${role.name}" from giver ${giverMember.user.tag} (${executorId}) in guild ${guild.id}`);
-          } catch (err: any) {
-            logger.warn(`Auto-mod: could not strip giver role "${role.name}" — ${err?.message ?? "hierarchy issue"}`);
-          }
-        }
-      }
-
-      if (receiverStripped.length > 0 || giverStripped.length > 0) {
+      // Givers are NOT automatically stripped — anyone can assign roles freely.
+      // Only the receiver has elevated roles removed (above).
+      // The giver is only punished if they are flagged for @everyone/@here abuse
+      // (handled in the mention-guard section above).
+      if (receiverStripped.length > 0) {
         logger.info(
-          { guildId: guild.id, giver: executorTag, receiver: targetTag, receiverStripped, giverStripped },
-          "Auto-mod: dangerous role grant — both parties stripped"
+          { guildId: guild.id, giver: executorTag, receiver: targetTag, receiverStripped },
+          "Auto-mod: elevated role granted — receiver stripped, giver left untouched"
         );
       }
     } catch (err) {
