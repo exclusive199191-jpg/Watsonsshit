@@ -1882,7 +1882,13 @@ export async function startBot() {
 
       const receiverStripped: string[] = [];
       if (elevatedAdded.size > 0 && !isReceiverExempt) {
+        const botHighest = guild.members.me?.roles.highest;
         for (const [, role] of elevatedAdded) {
+          // Only attempt removal of roles strictly below the bot's highest role
+          if (botHighest && role.comparePositionTo(botHighest) >= 0) {
+            logger.warn(`Auto-mod: skipping "${role.name}" from receiver ${newMember.user.tag} — at or above bot's highest role "${botHighest.name}"`);
+            continue;
+          }
           try {
             await newMember.roles.remove(role, "Auto-mod: dangerous role added — stripped immediately");
             receiverStripped.push(role.name);
@@ -1920,11 +1926,17 @@ export async function startBot() {
         await recordRoleEvent(guild, executorId, executorTag, newMember.id, targetTag, role.id, role.name, "removed");
       }
 
+      // ── Fetch antinuke config once — used by both mention-guard and giver-strip ──
+      const antinukeConfig = await getAntinukeConfig(guild.id).catch(() => null);
+      const whitelist      = antinukeConfig?.whitelist      ?? [];
+      const roleingExempt  = antinukeConfig?.roleingExempt  ?? [];
+
       // ── Mention-guard: flag check on ANY role assignment ─────────────────────
       // If the executor was previously flagged for @everyone/@here abuse, strip
       // their admin/mod/staff roles the moment they try to assign any role to anyone.
+      // roleingExempt users are excluded — they can assign roles freely.
       // This runs regardless of whether the assigned role is elevated.
-      if (anyRoleAdded && isMentionFlagged(guild.id, executorId) && !isTrustedOwner(executorId) && executorId !== guild.ownerId) {
+      if (anyRoleAdded && isMentionFlagged(guild.id, executorId) && !isTrustedOwner(executorId) && executorId !== guild.ownerId && !roleingExempt.includes(executorId)) {
         const flaggedGiver = await guild.members.fetch(executorId).catch(() => null);
         if (flaggedGiver) {
           logger.warn(
@@ -1970,9 +1982,7 @@ export async function startBot() {
       if (isTrustedOwner(executorId) || executorId === guild.ownerId) return;
 
       // Antinuke whitelist and roleing-exempt list both exempt the giver
-      const antinukeConfig = await getAntinukeConfig(guild.id).catch(() => null);
-      const whitelist      = antinukeConfig?.whitelist      ?? [];
-      const roleingExempt  = antinukeConfig?.roleingExempt  ?? [];
+      // (antinukeConfig / whitelist / roleingExempt already fetched above)
       if (whitelist.includes(executorId) || roleingExempt.includes(executorId)) return;
 
       const giverMember = await guild.members.fetch(executorId).catch(() => null);
@@ -2012,6 +2022,13 @@ export async function startBot() {
   client.on(Events.MessageCreate, async (message) => {
     if (message.author.bot) return;
 
+    // Mention-guard runs FIRST — before any content check.
+    // message.mentions.everyone is set by Discord regardless of Message Content Intent,
+    // so the strip fires even when content intent is disabled.
+    handleEveryoneMentionGuard(message).catch((err: any) => {
+      logger.error(`[MENTION-GUARD] Unhandled error in mention guard: ${err?.message}`);
+    });
+
     // Message Content Intent is not enabled in the Discord Developer Portal.
     // message.content will be empty for every message — commands cannot work.
     if (message.content === "") {
@@ -2022,11 +2039,6 @@ export async function startBot() {
       );
       return;
     }
-
-    // Mention-guard: detect and punish @everyone / @here abuse before anything else
-    handleEveryoneMentionGuard(message).catch((err: any) => {
-      logger.error(`[MENTION-GUARD] Unhandled error in mention guard: ${err?.message}`);
-    });
 
     // Anti-nuke: scan every non-bot message for link spam and mass mentions
     handleAntiNukeMessage(message).catch((err: any) => {
