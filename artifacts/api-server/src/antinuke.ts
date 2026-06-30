@@ -1150,7 +1150,7 @@ async function onAuditLogEntry(entry: GuildAuditLogsEntry, guild: Guild): Promis
       const addedRoles = addChange.new as Array<{ id: string; name: string }>;
 
       // Check if any of the granted roles carry admin/mod permissions
-      let grantedElevatedRoles: Array<{ id: string; name: string }> = [];
+      const grantedElevatedRoles: Array<{ id: string; name: string }> = [];
       for (const roleData of addedRoles) {
         const role = guild.roles.cache.get(roleData.id) ?? await guild.roles.fetch(roleData.id).catch(() => null);
         if (role && ELEVATED_PERMS_STRIP.some(p => role.permissions.has(p))) {
@@ -1159,72 +1159,23 @@ async function onAuditLogEntry(entry: GuildAuditLogsEntry, guild: Guild): Promis
       }
 
       if (grantedElevatedRoles.length > 0) {
-        // Elevated role granted — strip receiver immediately, strip giver unless roleing-exempt.
-        // Trusted owner (hardcoded + BOT_OWNER_ID) is always exempt from both.
-        const targetId = (entry.target as { id?: string } | null)?.id;
-        const giverRoleingExempt = config.roleingExempt.includes(executorId);
-
-        const [giverMember, receiverMember] = await Promise.all([
-          (isBotOwner(executorId) || giverRoleingExempt) ? Promise.resolve(null) : guild.members.fetch(executorId).catch(() => null),
-          targetId && !isBotOwner(targetId) ? guild.members.fetch(targetId).catch(() => null) : Promise.resolve(null),
-        ]);
-
-        const giverStripped: string[] = [];
-        const receiverStripped: string[] = [];
-
-        if (giverMember) {
-          for (const role of giverMember.roles.cache.values()) {
-            if (role.managed || role.id === guild.id) continue;
-            if (ELEVATED_PERMS_STRIP.some(p => role.permissions.has(p))) {
-              try {
-                await giverMember.roles.remove(role, "Anti-Nuke: granted elevated role — giver stripped immediately");
-                giverStripped.push(role.name);
-              } catch { /* hierarchy — best effort */ }
-            }
-          }
-        }
-
-        if (receiverMember) {
-          for (const role of receiverMember.roles.cache.values()) {
-            if (role.managed || role.id === guild.id) continue;
-            if (ELEVATED_PERMS_STRIP.some(p => role.permissions.has(p))) {
-              try {
-                await receiverMember.roles.remove(role, "Anti-Nuke: received elevated role — receiver stripped immediately");
-                receiverStripped.push(role.name);
-              } catch { /* hierarchy — best effort */ }
-            }
-          }
-        }
-
+        // Stripping is handled entirely by the GuildMemberUpdate handler in bot.ts,
+        // which checks hierarchy, exemptions (whitelist/roleingExempt), and strips
+        // both receiver and giver with proper Discord role-position checks.
+        // This handler only logs the event to the enforcement channel.
+        const targetId      = (entry.target as { id?: string } | null)?.id;
         const executorLabel = entry.executor.tag ?? entry.executor.id;
-        const targetLabel   = receiverMember?.user.tag ?? targetId ?? "Unknown";
-
-        const giverNote = isBotOwner(executorId)
-          ? "Exempt (trusted owner)"
-          : giverRoleingExempt
-            ? "Exempt (roleing-exempt list)"
-            : giverStripped.length > 0
-              ? giverStripped.map(r => `\`${r}\``).join(", ")
-              : "None";
-
-        const receiverNote = targetId && isBotOwner(targetId)
-          ? "Exempt (trusted owner)"
-          : receiverStripped.length > 0
-            ? receiverStripped.map(r => `\`${r}\``).join(", ")
-            : "None";
+        const giverExempt   = isBotOwner(executorId) || config.roleingExempt.includes(executorId);
 
         const embed = new EmbedBuilder()
           .setColor(Colors.DarkRed)
-          .setTitle("🛡️ Elevated Role Granted — Action Taken")
-          .setDescription(
-            `<@${executorId}> gave elevated role(s) to <@${targetId ?? "unknown"}>.`
-          )
+          .setTitle("🛡️ Elevated Role Granted — Enforcement Active")
+          .setDescription(`<@${executorId}> gave elevated role(s) to <@${targetId ?? "unknown"}>.`)
           .addFields(
-            { name: "Giver",             value: `<@${executorId}> (\`${executorLabel}\`)`,    inline: true  },
-            { name: "Receiver",          value: `<@${targetId ?? "?"}> (\`${targetLabel}\`)`, inline: true  },
-            { name: "Role(s) Granted",   value: grantedElevatedRoles.map(r => `\`${r.name}\``).join(", "), inline: false },
-            { name: "Giver Stripped",    value: giverNote,    inline: false },
-            { name: "Receiver Stripped", value: receiverNote, inline: false },
+            { name: "Giver",           value: `<@${executorId}> (\`${executorLabel}\`)`,                              inline: true  },
+            { name: "Receiver",        value: `<@${targetId ?? "?"}>`,                                                 inline: true  },
+            { name: "Role(s) Granted", value: grantedElevatedRoles.map(r => `\`${r.name}\``).join(", "),              inline: false },
+            { name: "Action",          value: giverExempt ? "Exempt — no strips applied" : "Giver & receiver stripped by auto-mod", inline: false },
           )
           .setFooter({ text: "Anti-Nuke System  ·  Elevated Role Policy" })
           .setTimestamp();
@@ -1237,18 +1188,17 @@ async function onAuditLogEntry(entry: GuildAuditLogsEntry, guild: Guild): Promis
           executorTag: executorLabel,
           count: 1,
           threshold: 1,
-          result: `giver stripped (${giverStripped.length}), receiver stripped (${receiverStripped.length})`,
+          result: giverExempt ? "exempt — no strips" : "giver & receiver stripped by GuildMemberUpdate handler",
         });
 
         logger.warn(
-          `Anti-nuke: elevated role grant by ${executorLabel} (${executorId}) → ${targetId} in guild ${guild.id} — ` +
-          `giver: ${giverRoleingExempt ? "roleing-exempt, not stripped" : `stripped ${giverStripped.length} roles`}, ` +
-          `receiver: stripped ${receiverStripped.length} roles`
+          `Anti-nuke: elevated role grant detected — ${executorLabel} (${executorId}) → ${targetId} in guild ${guild.id}. ` +
+          `Enforcement handled by GuildMemberUpdate handler.`
         );
         break;
       }
 
-      // Non-elevated role grant — fall back to rate-limit mass-grant detection
+      // Non-elevated role grant — rate-limit mass-grant detection
       const n = tick(guild.id, executorId, "roleGrant", w);
       if (n >= 5)
         await handleViolation(guild, entry.executor, config, "roleGrant", "Mass Role Grant", n, 5);
